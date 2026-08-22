@@ -26,6 +26,9 @@ guest_agent_acl_hint = pr.guest_agent_acl_hint
 ProxmoxAPIError = pr.ProxmoxAPIError
 next_unused_vmid = pr.next_unused_vmid
 is_vmid_conflict = pr.is_vmid_conflict
+form_encode = pr.form_encode
+proxmox_not_implemented = pr.proxmox_not_implemented
+ping_succeeded = pr.ping_succeeded
 
 
 class ParseGitHubTargetTests(unittest.TestCase):
@@ -107,6 +110,21 @@ class MiscTests(unittest.TestCase):
         self.assertIn("pveum role add RunnerFleet", hint)
         self.assertIn("VM.GuestAgent.Audit", hint)
         self.assertIn("packer@pve!imagegen", hint)
+
+    def test_form_encode_command_array(self):
+        encoded = form_encode({"command": ["bash", "/tmp/proxmox-runner-fleet.sh"]}).decode()
+        self.assertEqual(encoded, "command=bash&command=%2Ftmp%2Fproxmox-runner-fleet.sh")
+        self.assertNotIn("[", encoded)
+
+    def test_ping_not_implemented_is_failure(self):
+        get_body = {
+            "data": None,
+            "message": "Method 'GET /nodes/pve1/qemu/701/agent/ping' not implemented",
+        }
+        self.assertIsNotNone(proxmox_not_implemented(get_body))
+        self.assertFalse(ping_succeeded(None))
+        self.assertFalse(ping_succeeded(get_body))
+        self.assertTrue(ping_succeeded({"result": {}}))
 
 
 if __name__ == "__main__":

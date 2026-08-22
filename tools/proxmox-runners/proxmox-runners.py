@@ -125,6 +125,38 @@ def parse_storage_id(disk_value: str) -> str:
     return head.split(":", 1)[0]
 
 
+def form_encode(params: dict[str, Any]) -> bytes:
+    """Encode PVE form fields. Arrays become repeated keys (command=a&command=b)."""
+    pairs: list[tuple[str, str]] = []
+    for key, value in params.items():
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                pairs.append((key, str(item)))
+        elif value is None:
+            continue
+        else:
+            pairs.append((key, str(value)))
+    return urllib.parse.urlencode(pairs).encode()
+
+
+def proxmox_not_implemented(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("message")
+    if isinstance(message, str) and "not implemented" in message.lower():
+        return message
+    return None
+
+
+def ping_succeeded(data: Any) -> bool:
+    """POST ping returns {result: {}}. GET returns data=null plus a 'not implemented' message."""
+    if data is None:
+        return False
+    if proxmox_not_implemented(data):
+        return False
+    return True
+
+
 def next_unused_vmid(used: set[int], start: int) -> int:
     """Return the smallest VMID >= start that is not already in the cluster."""
     if start < 100:
@@ -266,13 +298,17 @@ class Proxmox:
         headers = dict(self.headers)
         if method in {"GET", "HEAD", "DELETE"}:
             if params:
-                url += "?" + urllib.parse.urlencode(params, doseq=True)
+                url += "?" + form_encode(params).decode()
         else:
-            data = urllib.parse.urlencode(params or {}, doseq=True).encode()
+            data = form_encode(params or {})
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         result = self.http.request(method, url, headers=headers, data=data, timeout=timeout)
-        if isinstance(result, dict) and "data" in result:
-            return result["data"]
+        if isinstance(result, dict):
+            note = proxmox_not_implemented(result)
+            if note:
+                raise ProxmoxAPIError(f"{method} {path} not implemented: {note}", status=501)
+            if "data" in result:
+                return result["data"]
         return result
 
     def wait_task(self, upid: str, timeout: int) -> None:
@@ -778,16 +814,22 @@ class Fleet:
     def ping_agent(self, node: str, vmid: int) -> Any:
         path = f"nodes/{node}/qemu/{vmid}/agent/ping"
         try:
-            return self.pve.call("POST", path, timeout=AGENT_PING_HTTP_TIMEOUT)
+            data = self.pve.call("POST", path, timeout=AGENT_PING_HTTP_TIMEOUT)
         except Exception as exc:
             self._fail_if_agent_forbidden(exc)
             text = str(exc)
             if http_status(exc) == 501 or "not implemented" in text.lower():
                 fatal(
-                    f"agent/ping must be POST; GET is not implemented on this PVE. "
-                    f"This is a CLI bug if the request was GET. Last error: {trim_error(exc)}"
+                    f"agent/ping must be POST; GET is not implemented on this PVE "
+                    f"and must not be treated as success. Last error: {trim_error(exc)}"
                 )
             raise
+        if not ping_succeeded(data):
+            raise RuntimeError(
+                "agent/ping returned empty or not-implemented data "
+                "(GET on this PVE returns HTTP 200 with data=null; POST is required)"
+            )
+        return data
 
     def wait_agent(self, node: str, vmid: int, timeout: int = AGENT_WAIT_TIMEOUT) -> None:
         started = time.time()
@@ -824,6 +866,7 @@ class Fleet:
         )
 
     def agent_exec(self, node: str, vmid: int, command: list[str], timeout: int = 1800) -> tuple[int, str, str]:
+        log(f"guest-exec on VM {vmid} / {node}: {' '.join(command)}")
         result = self.pve.call(
             "POST",
             f"nodes/{node}/qemu/{vmid}/agent/exec",
@@ -833,7 +876,10 @@ class Fleet:
         pid = (result or {}).get("pid")
         if pid is None:
             raise RuntimeError(f"guest-exec returned no pid: {result}")
-        deadline = time.time() + timeout
+        log(f"guest-exec pid {pid} started; waiting up to {timeout}s (output when it exits)")
+        started = time.time()
+        deadline = started + timeout
+        last_heartbeat = started
         while time.time() < deadline:
             status = self.pve.call(
                 "GET",
@@ -846,6 +892,10 @@ class Fleet:
                     status.get("out-data") or "",
                     status.get("err-data") or "",
                 )
+            now = time.time()
+            if now - last_heartbeat >= AGENT_WAIT_HEARTBEAT:
+                log(f"guest-exec pid {pid} still running ({int(now - started)}s elapsed)")
+                last_heartbeat = now
             time.sleep(3)
         raise TimeoutError(f"guest-exec pid {pid} timed out")
 
@@ -859,6 +909,7 @@ class Fleet:
     def setup_guest(self, node: str, vmid: int, name: str) -> None:
         if not GUEST_SETUP.is_file():
             fatal(f"missing {GUEST_SETUP}")
+        log(f"minting GitHub registration token for {name}")
         token = self.gh.registration_token(self.settings.github_kind, self.settings.github_target)
         env_text = (
             f"RUNNER_URL={self.settings.github_url}\n"
@@ -869,8 +920,13 @@ class Fleet:
             f"RUNNER_DIR={self.settings.runner_dir}\n"
             f"RUNNER_TARBALL_URL={self.settings.runner_tarball_url}\n"
         )
+        log(f"writing guest-setup files to VM {vmid} / {node} via qemu-guest-agent")
         self.agent_write(node, vmid, "/tmp/proxmox-runner-fleet.env", env_text)
         self.agent_write(node, vmid, "/tmp/proxmox-runner-fleet.sh", GUEST_SETUP.read_text(encoding="utf-8"))
+        log(
+            f"running guest-setup on {name} (cloud-init check, post-gen, runner download). "
+            "This can take several minutes; guest stdout is printed when exec finishes."
+        )
         code, out, err = self.agent_exec(
             node,
             vmid,
@@ -883,6 +939,7 @@ class Fleet:
             print(err.rstrip(), file=sys.stderr)
         if code != 0:
             fatal(f"guest setup failed on {name} (VM {vmid}, node {node}) with exit {code}")
+        log(f"guest-setup finished on {name}; removing temp files")
         self.agent_exec(node, vmid, ["rm", "-f", "/tmp/proxmox-runner-fleet.env", "/tmp/proxmox-runner-fleet.sh"])
 
     def plan(self, count: int, nodes: list[str]) -> list[PlannedVM]:

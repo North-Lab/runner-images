@@ -23,7 +23,14 @@ cleanup() {
 trap cleanup EXIT
 
 if command -v cloud-init >/dev/null 2>&1; then
-    cloud-init status --wait || true
+    echo "cloud-init status: $(cloud-init status 2>/dev/null || true)"
+    if command -v timeout >/dev/null 2>&1; then
+        if ! timeout 180 cloud-init status --wait; then
+            echo "cloud-init still running after 180s; continuing"
+        fi
+    else
+        echo "timeout(1) not available; not waiting unbounded for cloud-init"
+    fi
 fi
 
 if [ -d /opt/post-generation ] && [ ! -f /opt/post-generation/.fleet-done ]; then
