@@ -13,6 +13,7 @@ Upstream Azure-only instructions remain in [create-image-and-azure-resources.md]
 - [Required variables](#required-variables)
 - [Optional variables](#optional-variables)
 - [Clone the template into a runner VM](#clone-the-template-into-a-runner-vm)
+- [Deploy a runner fleet](#deploy-a-runner-fleet)
 - [Post-generation scripts](#post-generation-scripts)
 - [How this differs from Azure](#how-this-differs-from-azure)
 - [Troubleshooting](#troubleshooting)
@@ -189,7 +190,91 @@ In the UI: right-click the template → **Clone**, then edit Cloud-Init (user, S
 
 Cloud-Init on the clone creates the user you set (`ciuser`). That user needs sudo for post-generation, matching the Azure Linux note.
 
-Install and register [actions/runner](https://github.com/actions/runner) on the clone after post-generation. This repository only builds the disk image.
+Install and register [actions/runner](https://github.com/actions/runner) on the clone after post-generation, or use the [fleet tool](#deploy-a-runner-fleet) to do this on every node.
+
+## Deploy a runner fleet
+
+`tools/proxmox-runners/proxmox-runners.py` clones the Packer template, spreads VMs across online Proxmox nodes, runs `/opt/post-generation`, and registers `actions/runner` as a systemd service. One command plus a gitignored config is enough for a three-node lab.
+
+### Prerequisites
+
+- The Ubuntu 26.04 template already built (see [Build the template](#build-the-template)).
+- Python 3.11+ on the machine that talks to the Proxmox API (stdlib only; no pip packages).
+- The same Proxmox API token style as Packer (`user@realm!tokenid` + `PROXMOX_TOKEN`).
+- A GitHub PAT in `GITHUB_TOKEN` or `GH_TOKEN`. It is used only to mint a **short-lived registration token per VM**.
+  - Repo runners: classic `repo` scope (or fine-grained Administration: Read and write).
+  - Org runners: classic `admin:org` (or Organization self-hosted runners).
+- qemu-guest-agent working on clones (the template enables it). The tool execs as root through the agent; SSH is optional.
+
+Do not commit tokens. Copy the example config:
+
+```bash
+cp tools/proxmox-runners/fleet.example.toml tools/proxmox-runners/fleet.toml
+```
+
+`tools/proxmox-runners/fleet.toml` is gitignored. Prefer leaving `token` fields empty and exporting `PROXMOX_TOKEN` and `GITHUB_TOKEN`.
+
+### Storage assumption
+
+Proxmox **cannot** clone a template whose disks live on non-shared storage (`local-lvm`, local `dir`) directly onto another node (`qm clone --target` requires shared storage).
+
+| Template disk storage | What the tool does |
+| --------------------- | ------------------ |
+| Shared (`nfs`, `ceph`/`rbd`, `cifs`, … `shared=1`) | Full clone with `target=<node>`. |
+| Node-local (`local-lvm`, typical home lab) | Full clone on the template node, then **offline migrate** with `with-local-disks=1` to create a template replica on each target node. Runner VMs are then cloned locally on that node. |
+
+Each target node must already have a storage with the **same id** as `[proxmox].storage` (default `local-lvm`) and `content` including `images`. If a node cannot receive that disk, the tool exits with the storages that node does have. It does not invent a storage or silently place every VM on the template node.
+
+### Discover nodes
+
+Node names are not hardcoded. The tool calls `GET /nodes` and uses **online** nodes. Optional `[proxmox].nodes` or `--nodes pve1,pve2,pve3` is an allowlist; any allowlisted node that is missing or offline is an error.
+
+```bash
+export PROXMOX_URL PROXMOX_USERNAME PROXMOX_TOKEN
+python3 tools/proxmox-runners/proxmox-runners.py nodes --config tools/proxmox-runners/fleet.toml
+```
+
+### Roll out
+
+`--count 6` on three online nodes places two VMs per node (round-robin: `gh-runner-01` … `gh-runner-06`). `--per-node 2` is the same if three nodes are online.
+
+```bash
+export PROXMOX_URL PROXMOX_USERNAME PROXMOX_TOKEN
+export GITHUB_TOKEN
+
+python3 tools/proxmox-runners/proxmox-runners.py deploy \
+  --config tools/proxmox-runners/fleet.toml \
+  --count 6
+```
+
+For each VM the tool:
+
+1. Allocates a unique VMID (`cluster/nextid`, or `[vm].vmid_start`).
+2. Full-clones the template (or the per-node replica).
+3. Applies Cloud-Init (`ciuser`, optional SSH key, `ip=dhcp` or `ip=192.168.1.{n}/24,gw=...`).
+4. Starts the VM and waits for qemu-guest-agent.
+5. Runs `/opt/post-generation` as root (once per VM; stamped with `.fleet-done`).
+6. Downloads `actions/runner` **linux-x64** (latest release unless `runner_version` is pinned).
+7. Registers with a **fresh** registration token (`POST .../actions/runners/registration-token`) for the repo or org in `[github].url`.
+8. Installs the systemd service with `svc.sh install` / `svc.sh start` as `ciuser` (default `runner`).
+
+Default labels: `self-hosted,linux,x64,ubuntu-26.04`. Add extras with `[github].extra_labels` or `--labels`.
+
+Existing VMs with the same name are reused (not recloned). Guests that already have `/opt/actions-runner/.runner` skip `config.sh`. Online GitHub registrations with that name are left in place; guest setup still starts the service if needed.
+
+```bash
+python3 tools/proxmox-runners/proxmox-runners.py status --config tools/proxmox-runners/fleet.toml
+```
+
+### Teardown
+
+```bash
+python3 tools/proxmox-runners/proxmox-runners.py destroy \
+  --config tools/proxmox-runners/fleet.toml \
+  --yes
+```
+
+Stops and deletes VMs whose names start with `name_prefix` (default `gh-runner-`) and removes matching GitHub runner registrations. `--count N` limits that to `gh-runner-01` … `N`. `--keep-github` leaves GitHub registrations. Packer templates (including per-node replicas named `ubuntu-2604-runner-<node>`) are not deleted.
 
 ## Post-generation scripts
 
@@ -224,3 +309,6 @@ Azure CLI, azcopy, and other tools from the upstream toolset are still installed
 - **Out of space during provisioners** — raise `disk_size` above `75G`. The runner image is close to the Azure 75 GiB default.
 - **OOM during provisioners** — raise `vm_memory`. 16 GiB matches the Azure build size.
 - **`packer validate` on Azure templates** — keep using `images/ubuntu/templates`. The Proxmox plugin is only required under `images/ubuntu/templates-proxmox`, so Azure CI does not need it.
+- **Fleet deploy: node cannot receive a disk** — `[proxmox].storage` must exist on that node with `images` content. For `local-lvm`, create the same storage id on every node. Shared storage must be mounted on every target.
+- **Fleet deploy: qemu-guest-agent timeout** — Cloud-Init/DHCP never came up, or the agent is disabled. `python3 tools/proxmox-runners/proxmox-runners.py status` shows VM power state; check the guest NIC on the bridge.
+- **Fleet deploy: GitHub registration token failed** — the PAT in `GITHUB_TOKEN` needs repo administration (repo runners) or org runner admin (org URL). The PAT is not the runner registration token; the tool mints those per VM.
