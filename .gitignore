@@ -401,3 +401,7 @@ images/*/*-temp.json
 # Local Proxmox Packer variable files (may contain API tokens)
 *.auto.pkrvars.hcl
 images/ubuntu/templates-proxmox/proxmox.pkrvars.hcl
+
+# Local Proxmox runner fleet config (may contain API tokens)
+tools/proxmox-runners/fleet.toml
+tools/proxmox-runners/fleet.json
