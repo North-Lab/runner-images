@@ -19,6 +19,7 @@ parse_storage_id = pr.parse_storage_id
 render_ipconfig = pr.render_ipconfig
 resolve_count = pr.resolve_count
 runner_name = pr.runner_name
+trim_error = pr.trim_error
 
 
 class ParseGitHubTargetTests(unittest.TestCase):
@@ -72,6 +73,14 @@ class MiscTests(unittest.TestCase):
     def test_default_labels(self):
         self.assertIn("ubuntu-26.04", default_labels(["home-lab"]))
         self.assertIn("home-lab", default_labels(["home-lab"]))
+
+    def test_trim_error(self):
+        self.assertEqual(trim_error(RuntimeError("guest agent is not running")), "guest agent is not running")
+        long = RuntimeError("x" * 200)
+        trimmed = trim_error(long, limit=40)
+        self.assertEqual(len(trimmed), 40)
+        self.assertTrue(trimmed.endswith("..."))
+        self.assertEqual(trim_error(TimeoutError("")), "TimeoutError")
 
 
 if __name__ == "__main__":

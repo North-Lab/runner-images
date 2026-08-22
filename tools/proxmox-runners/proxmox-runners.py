@@ -24,6 +24,10 @@ TOOL_DIR = Path(__file__).resolve().parent
 GUEST_SETUP = TOOL_DIR / "guest-setup.sh"
 DEFAULT_LABELS = ["self-hosted", "linux", "x64", "ubuntu-26.04"]
 RUNNER_REPO = "actions/runner"
+AGENT_PING_HTTP_TIMEOUT = 8
+AGENT_WAIT_TIMEOUT = 1800
+AGENT_WAIT_HEARTBEAT = 30
+AGENT_ERROR_LIMIT = 160
 
 
 def log(message: str) -> None:
@@ -121,6 +125,15 @@ def parse_storage_id(disk_value: str) -> str:
     return head.split(":", 1)[0]
 
 
+def trim_error(exc: BaseException, limit: int = AGENT_ERROR_LIMIT) -> str:
+    text = " ".join(str(exc).split())
+    if not text:
+        text = exc.__class__.__name__
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
 class HttpClient:
     def __init__(self, insecure: bool = False) -> None:
         ctx = ssl.create_default_context()
@@ -147,7 +160,12 @@ class HttpClient:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"{method} {url} failed: HTTP {exc.code}: {detail}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"{method} {url} timed out after {timeout}s") from exc
         except urllib.error.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+                raise RuntimeError(f"{method} {url} timed out after {timeout}s") from exc
             raise RuntimeError(f"{method} {url} failed: {exc}") from exc
         if not body:
             return None
@@ -658,23 +676,43 @@ class Fleet:
     def start_vm(self, node: str, vmid: int) -> None:
         status = self.pve.call("GET", f"nodes/{node}/qemu/{vmid}/status/current") or {}
         if status.get("status") == "running":
+            log(f"VM {vmid} is already running on {node}; waiting for qemu-guest-agent")
             return
         log(f"starting VM {vmid} on {node}")
         self.pve.post_task(f"nodes/{node}/qemu/{vmid}/status/start", {}, 300)
 
-    def wait_agent(self, node: str, vmid: int, timeout: int = 900) -> None:
-        deadline = time.time() + timeout
+    def wait_agent(self, node: str, vmid: int, timeout: int = AGENT_WAIT_TIMEOUT) -> None:
+        started = time.time()
+        deadline = started + timeout
         last_error = "qemu-guest-agent not responding"
+        last_heartbeat = started
+        log(f"waiting for qemu-guest-agent on VM {vmid} / {node} (up to {timeout}s)")
         while time.time() < deadline:
             try:
-                self.pve.call("GET", f"nodes/{node}/qemu/{vmid}/agent/ping")
+                self.pve.call(
+                    "GET",
+                    f"nodes/{node}/qemu/{vmid}/agent/ping",
+                    timeout=AGENT_PING_HTTP_TIMEOUT,
+                )
+                elapsed = int(time.time() - started)
+                log(f"qemu-guest-agent is up on VM {vmid} / {node} after {elapsed}s")
                 return
-            except RuntimeError as exc:
-                last_error = str(exc)
-                time.sleep(5)
+            except Exception as exc:
+                last_error = trim_error(exc)
+            now = time.time()
+            if now - last_heartbeat >= AGENT_WAIT_HEARTBEAT:
+                elapsed = int(now - started)
+                log(
+                    f"still waiting for qemu-guest-agent on VM {vmid} / {node} "
+                    f"({elapsed}s elapsed): {last_error}"
+                )
+                last_heartbeat = now
+            time.sleep(2)
         fatal(
             f"VM {vmid} on {node} did not get a qemu-guest-agent ping within {timeout}s. "
-            f"Check agent=enabled, Cloud-Init, and DHCP. Last error: {last_error}"
+            f"Check agent=enabled, Cloud-Init, and DHCP. "
+            f"On the node: qm agent {vmid} ping. In the guest: systemctl status qemu-guest-agent. "
+            f"Last error: {last_error}"
         )
 
     def agent_exec(self, node: str, vmid: int, command: list[str], timeout: int = 1800) -> tuple[int, str, str]:
