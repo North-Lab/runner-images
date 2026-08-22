@@ -782,6 +782,8 @@ class Fleet:
         raise RuntimeError(f"clone {planned.name} failed: {last_error}")
 
     def apply_cloudinit(self, node: str, vmid: int, index: int) -> None:
+        # Proxmox Cloud-Init has no cigroups field for ciuser. docker
+        # membership is applied in guest-setup.sh before svc.sh starts.
         params: dict[str, Any] = {
             "ciuser": self.settings.ciuser,
             "ipconfig0": render_ipconfig(self.settings.ipconfig, index, self.settings.ip_start),
