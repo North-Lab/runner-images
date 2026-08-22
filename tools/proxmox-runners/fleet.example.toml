@@ -1,0 +1,46 @@
+# Example fleet config. Copy to fleet.toml (gitignored) and fill in real values.
+# Secrets can stay in the environment instead of this file:
+#   PROXMOX_URL, PROXMOX_USERNAME, PROXMOX_TOKEN, PROXMOX_PASSWORD
+#   GITHUB_TOKEN or GH_TOKEN  (PAT used only to mint per-VM registration tokens)
+#
+#   python3 tools/proxmox-runners/proxmox-runners.py deploy --config tools/proxmox-runners/fleet.toml --count 6
+
+[proxmox]
+url = "https://pve.lab.example:8006/api2/json"
+username = "packer@pve!imagegen"
+# token = ""          # prefer PROXMOX_TOKEN
+# password = ""       # only if not using a token
+insecure_skip_tls_verify = true
+# Optional allowlist. Omit to use every online cluster node from GET /nodes.
+# nodes = ["pve1", "pve2", "pve3"]
+template_name = "ubuntu-2604-runner"
+# template_vmid = 9000
+# Disk storage for full clones. Must exist on each target node with images content.
+# local-lvm is node-local: the tool clones on the template node then migrates
+# with-local-disks. Shared storage (nfs, ceph, cifs) clones directly to the target.
+storage = "local-lvm"
+task_timeout_seconds = 7200
+
+[vm]
+name_prefix = "gh-runner"
+# vmid_start = 9100   # otherwise cluster nextid is used
+cores = 4
+memory_mb = 8192
+ciuser = "runner"
+# ssh_public_key_file = "~/.ssh/id_ed25519.pub"
+ipconfig = "ip=dhcp"
+# Numbered scheme: {n} is replaced with ip_start + runner_index - 1
+# ipconfig = "ip=192.168.1.{n}/24,gw=192.168.1.1"
+# ip_start = 50
+# nameserver = "1.1.1.1"
+# searchdomain = "lab.example"
+# vlan_tag = ""
+
+[github]
+# Repo or org URL (https://github.com/owner/repo or https://github.com/org)
+url = "https://github.com/example/repo"
+# token = ""          # prefer GITHUB_TOKEN / GH_TOKEN
+labels = ["self-hosted", "linux", "x64", "ubuntu-26.04"]
+# extra_labels = ["home-lab"]
+# runner_version = "2.328.0"   # omit to resolve latest linux-x64
+runner_dir = "/opt/actions-runner"
