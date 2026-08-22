@@ -20,6 +20,12 @@ render_ipconfig = pr.render_ipconfig
 resolve_count = pr.resolve_count
 runner_name = pr.runner_name
 trim_error = pr.trim_error
+http_status = pr.http_status
+is_agent_forbidden = pr.is_agent_forbidden
+guest_agent_acl_hint = pr.guest_agent_acl_hint
+ProxmoxAPIError = pr.ProxmoxAPIError
+next_unused_vmid = pr.next_unused_vmid
+is_vmid_conflict = pr.is_vmid_conflict
 
 
 class ParseGitHubTargetTests(unittest.TestCase):
@@ -58,6 +64,13 @@ class PlacementTests(unittest.TestCase):
         args = type("A", (), {"count": None, "per_node": 2})()
         self.assertEqual(resolve_count(args, 3), 6)
 
+    def test_skip_used_vmids(self):
+        self.assertEqual(next_unused_vmid({701}, 701), 702)
+        self.assertEqual(next_unused_vmid({701, 702}, 701), 703)
+        self.assertEqual(next_unused_vmid({100}, 701), 701)
+        self.assertTrue(is_vmid_conflict(RuntimeError("close (rename) atomic file '.../701.conf' failed: File exists")))
+        self.assertFalse(is_vmid_conflict(RuntimeError("guest agent is not running")))
+
 
 class MiscTests(unittest.TestCase):
     def test_ipconfig_placeholder(self):
@@ -81,6 +94,19 @@ class MiscTests(unittest.TestCase):
         self.assertEqual(len(trimmed), 40)
         self.assertTrue(trimmed.endswith("..."))
         self.assertEqual(trim_error(TimeoutError("")), "TimeoutError")
+
+    def test_agent_forbidden(self):
+        forbidden = ProxmoxAPIError("POST ... failed: HTTP 403: Permission denied", status=403)
+        self.assertEqual(http_status(forbidden), 403)
+        self.assertTrue(is_agent_forbidden(forbidden))
+        self.assertTrue(is_agent_forbidden(RuntimeError("HTTP 401: authentication failed")))
+        self.assertTrue(is_agent_forbidden(RuntimeError("Permission check failed")))
+        self.assertFalse(is_agent_forbidden(RuntimeError("guest agent is not running")))
+        self.assertEqual(http_status(ProxmoxAPIError("GET ... HTTP 501: not implemented", status=501)), 501)
+        hint = guest_agent_acl_hint("packer@pve!imagegen")
+        self.assertIn("pveum role add RunnerFleet", hint)
+        self.assertIn("VM.GuestAgent.Audit", hint)
+        self.assertIn("packer@pve!imagegen", hint)
 
 
 if __name__ == "__main__":

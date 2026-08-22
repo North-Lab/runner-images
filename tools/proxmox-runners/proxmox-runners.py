@@ -125,6 +125,21 @@ def parse_storage_id(disk_value: str) -> str:
     return head.split(":", 1)[0]
 
 
+def next_unused_vmid(used: set[int], start: int) -> int:
+    """Return the smallest VMID >= start that is not already in the cluster."""
+    if start < 100:
+        start = 100
+    candidate = start
+    while candidate in used:
+        candidate += 1
+    return candidate
+
+
+def is_vmid_conflict(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "file exists" in text or "already exists" in text
+
+
 def trim_error(exc: BaseException, limit: int = AGENT_ERROR_LIMIT) -> str:
     text = " ".join(str(exc).split())
     if not text:
@@ -132,6 +147,43 @@ def trim_error(exc: BaseException, limit: int = AGENT_ERROR_LIMIT) -> str:
     if len(text) > limit:
         return text[: limit - 3] + "..."
     return text
+
+
+class ProxmoxAPIError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def http_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+    text = str(exc)
+    for code in (401, 403, 404, 405, 500, 501):
+        if f"HTTP {code}" in text:
+            return code
+    return None
+
+
+def is_agent_forbidden(exc: BaseException) -> bool:
+    if http_status(exc) in {401, 403}:
+        return True
+    text = str(exc).lower()
+    return "permission check failed" in text or "permission denied" in text
+
+
+def guest_agent_acl_hint(token_id: str) -> str:
+    ident = token_id or "user@realm!tokenid"
+    return (
+        f"Proxmox API token {ident} cannot use qemu-guest-agent (HTTP 401/403). "
+        "`qm agent <vmid> ping` can succeed because it runs as root on the node, not as this token. "
+        "Grant VM.GuestAgent.Audit + FileRead + FileWrite + Unrestricted (PVE 9), or VM.Monitor (PVE 8). "
+        "Example:\n"
+        '  pveum role add RunnerFleet -privs "VM.GuestAgent.Audit,VM.GuestAgent.FileRead,'
+        'VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted"\n'
+        f"  pveum acl modify / --token '{ident}' --role RunnerFleet"
+    )
 
 
 class HttpClient:
@@ -159,7 +211,10 @@ class HttpClient:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {url} failed: HTTP {exc.code}: {detail}") from exc
+            raise ProxmoxAPIError(
+                f"{method} {url} failed: HTTP {exc.code}: {detail}",
+                status=exc.code,
+            ) from exc
         except TimeoutError as exc:
             raise RuntimeError(f"{method} {url} timed out after {timeout}s") from exc
         except urllib.error.URLError as exc:
@@ -209,12 +264,12 @@ class Proxmox:
         url = f"{self.base}/{path.lstrip('/')}"
         data = None
         headers = dict(self.headers)
-        if params:
-            if method in {"GET", "DELETE"}:
+        if method in {"GET", "HEAD", "DELETE"}:
+            if params:
                 url += "?" + urllib.parse.urlencode(params, doseq=True)
-            else:
-                data = urllib.parse.urlencode(params, doseq=True).encode()
-                headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = urllib.parse.urlencode(params or {}, doseq=True).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
         result = self.http.request(method, url, headers=headers, data=data, timeout=timeout)
         if isinstance(result, dict) and "data" in result:
             return result["data"]
@@ -457,6 +512,7 @@ class Fleet:
             settings.insecure,
         )
         self._gh: GitHub | None = None
+        self._used_vmids: set[int] = set()
 
     @property
     def gh(self) -> GitHub:
@@ -569,6 +625,29 @@ class Fleet:
         value = self.pve.call("GET", "cluster/nextid")
         return int(value)
 
+    def cluster_vmids(self) -> set[int]:
+        used: set[int] = set()
+        for row in self.resources("vm"):
+            if row.get("vmid") is not None:
+                used.add(int(row["vmid"]))
+        return used
+
+    def allocate_vmid(self, used: set[int]) -> int:
+        if self.settings.vmid_start is not None:
+            vmid = next_unused_vmid(used, self.settings.vmid_start)
+            used.add(vmid)
+            return vmid
+        for _ in range(32):
+            candidate = self.next_vmid()
+            if candidate not in used:
+                used.add(candidate)
+                return candidate
+            vmid = next_unused_vmid(used, candidate + 1)
+            used.add(vmid)
+            return vmid
+        fatal("could not allocate a free Proxmox VMID")
+        return 0
+
     def vm_config(self, node: str, vmid: int) -> dict[str, Any]:
         return self.pve.call("GET", f"nodes/{node}/qemu/{vmid}/config") or {}
 
@@ -624,36 +703,47 @@ class Fleet:
         return {"node": node, "vmid": replica_vmid, "name": replica_name, "template": 1}
 
     def clone_runner(self, template: dict[str, Any], planned: PlannedVM, storage: str) -> int:
-        vmid = planned.vmid or self.next_vmid()
+        used = self._used_vmids
         source_node = template["node"]
-        params: dict[str, Any] = {
-            "newid": vmid,
-            "name": planned.name,
-            "full": 1,
-            "storage": storage,
-        }
-        if self.storage_is_shared(storage) and planned.node != source_node:
-            params["target"] = planned.node
-            log(f"cloning {template['vmid']} -> {vmid} ({planned.name}) on {planned.node} (shared {storage})")
-            self.pve.post_task(
-                f"nodes/{source_node}/qemu/{template['vmid']}/clone",
-                params,
-                self.settings.task_timeout,
-            )
-            return vmid
-
-        if planned.node != source_node:
-            fatal(
-                f"internal error: template for {planned.node} is still on {source_node}. "
-                "Local disks need a per-node template replica."
-            )
-        log(f"cloning {template['vmid']} -> {vmid} ({planned.name}) on {planned.node}")
-        self.pve.post_task(
-            f"nodes/{source_node}/qemu/{template['vmid']}/clone",
-            params,
-            self.settings.task_timeout,
-        )
-        return vmid
+        last_error: BaseException | None = None
+        for attempt in range(2):
+            if attempt == 0 and planned.vmid is not None:
+                vmid = planned.vmid
+                used.add(vmid)
+            else:
+                vmid = self.allocate_vmid(used)
+            planned.vmid = vmid
+            params: dict[str, Any] = {
+                "newid": vmid,
+                "name": planned.name,
+                "full": 1,
+                "storage": storage,
+            }
+            if self.storage_is_shared(storage) and planned.node != source_node:
+                params["target"] = planned.node
+                log(f"cloning {template['vmid']} -> {vmid} ({planned.name}) on {planned.node} (shared {storage})")
+            else:
+                if planned.node != source_node:
+                    fatal(
+                        f"internal error: template for {planned.node} is still on {source_node}. "
+                        "Local disks need a per-node template replica."
+                    )
+                log(f"cloning {template['vmid']} -> {vmid} ({planned.name}) on {planned.node}")
+            try:
+                self.pve.post_task(
+                    f"nodes/{source_node}/qemu/{template['vmid']}/clone",
+                    params,
+                    self.settings.task_timeout,
+                )
+                return vmid
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and is_vmid_conflict(exc):
+                    log(f"VMID {vmid} already exists in the cluster; retrying {planned.name} with a new id")
+                    planned.vmid = None
+                    continue
+                raise
+        raise RuntimeError(f"clone {planned.name} failed: {last_error}")
 
     def apply_cloudinit(self, node: str, vmid: int, index: int) -> None:
         params: dict[str, Any] = {
@@ -681,6 +771,24 @@ class Fleet:
         log(f"starting VM {vmid} on {node}")
         self.pve.post_task(f"nodes/{node}/qemu/{vmid}/status/start", {}, 300)
 
+    def _fail_if_agent_forbidden(self, exc: BaseException) -> None:
+        if is_agent_forbidden(exc):
+            fatal(guest_agent_acl_hint(self.settings.proxmox_username))
+
+    def ping_agent(self, node: str, vmid: int) -> Any:
+        path = f"nodes/{node}/qemu/{vmid}/agent/ping"
+        try:
+            return self.pve.call("POST", path, timeout=AGENT_PING_HTTP_TIMEOUT)
+        except Exception as exc:
+            self._fail_if_agent_forbidden(exc)
+            text = str(exc)
+            if http_status(exc) == 501 or "not implemented" in text.lower():
+                fatal(
+                    f"agent/ping must be POST; GET is not implemented on this PVE. "
+                    f"This is a CLI bug if the request was GET. Last error: {trim_error(exc)}"
+                )
+            raise
+
     def wait_agent(self, node: str, vmid: int, timeout: int = AGENT_WAIT_TIMEOUT) -> None:
         started = time.time()
         deadline = started + timeout
@@ -689,15 +797,14 @@ class Fleet:
         log(f"waiting for qemu-guest-agent on VM {vmid} / {node} (up to {timeout}s)")
         while time.time() < deadline:
             try:
-                self.pve.call(
-                    "GET",
-                    f"nodes/{node}/qemu/{vmid}/agent/ping",
-                    timeout=AGENT_PING_HTTP_TIMEOUT,
-                )
+                self.ping_agent(node, vmid)
                 elapsed = int(time.time() - started)
                 log(f"qemu-guest-agent is up on VM {vmid} / {node} after {elapsed}s")
                 return
+            except SystemExit:
+                raise
             except Exception as exc:
+                self._fail_if_agent_forbidden(exc)
                 last_error = trim_error(exc)
             now = time.time()
             if now - last_heartbeat >= AGENT_WAIT_HEARTBEAT:
@@ -712,7 +819,8 @@ class Fleet:
             f"VM {vmid} on {node} did not get a qemu-guest-agent ping within {timeout}s. "
             f"Check agent=enabled, Cloud-Init, and DHCP. "
             f"On the node: qm agent {vmid} ping. In the guest: systemctl status qemu-guest-agent. "
-            f"Last error: {last_error}"
+            f"If qm ping works but this CLI fails, the API token needs guest-agent privileges "
+            f"(see docs). Last error: {last_error}"
         )
 
     def agent_exec(self, node: str, vmid: int, command: list[str], timeout: int = 1800) -> tuple[int, str, str]:
@@ -779,8 +887,9 @@ class Fleet:
 
     def plan(self, count: int, nodes: list[str]) -> list[PlannedVM]:
         assignment = assign_nodes(nodes, count)
+        used = self.cluster_vmids()
+        self._used_vmids = used
         planned: list[PlannedVM] = []
-        next_free = self.settings.vmid_start
         for index, node in enumerate(assignment, start=1):
             name = runner_name(self.settings.name_prefix, index)
             existing = self.find_vm(name)
@@ -789,11 +898,11 @@ class Fleet:
                 item.existed = True
                 item.vmid = int(existing["vmid"])
                 item.node = existing["node"]
+                used.add(item.vmid)
                 log(f"reusing existing VM {item.vmid} ({name}) on {item.node}")
             else:
-                if next_free is not None:
-                    item.vmid = next_free
-                    next_free += 1
+                item.vmid = self.allocate_vmid(used)
+                log(f"planning {name} on {node} as VMID {item.vmid}")
             planned.append(item)
         return planned
 
