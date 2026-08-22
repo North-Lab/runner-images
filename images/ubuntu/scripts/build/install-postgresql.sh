@@ -11,7 +11,9 @@ source $HELPER_SCRIPTS/install.sh
 REPO_URL="https://apt.postgresql.org/pub/repos/apt/"
 
 # Preparing repo for PostgreSQL
-wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor > /usr/share/keyrings/postgresql.gpg
+key_file=$(download_with_retry "https://www.postgresql.org/media/keys/ACCC4CF8.asc" "/tmp/ACCC4CF8.asc")
+gpg --batch --dearmor --output /usr/share/keyrings/postgresql.gpg "$key_file"
+rm -f "$key_file"
 echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] $REPO_URL $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
 
 # Fetch PostgreSQL version to install from the toolset
