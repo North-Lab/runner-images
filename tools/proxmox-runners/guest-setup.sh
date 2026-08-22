@@ -43,6 +43,27 @@ if ! id "$RUNNER_USER" >/dev/null 2>&1; then
     useradd --create-home --shell /bin/bash "$RUNNER_USER"
 fi
 
+# Packer installs Docker as the build user; that account is deprovisioned.
+# The systemd runner runs as ciuser (runner) and needs the docker group
+# before svc.sh starts so jobs can use unix:///var/run/docker.sock.
+in_docker_group=0
+if id -nG "$RUNNER_USER" | grep -qw docker; then
+    in_docker_group=1
+fi
+if [ "$in_docker_group" -eq 0 ]; then
+    if ! getent group docker >/dev/null 2>&1; then
+        if command -v docker >/dev/null 2>&1 || [ -e /var/run/docker.sock ]; then
+            groupadd --system docker
+        else
+            echo "Docker is not installed; not creating the docker group"
+        fi
+    fi
+    if getent group docker >/dev/null 2>&1; then
+        usermod -aG docker "$RUNNER_USER"
+        echo "Added ${RUNNER_USER} to docker group"
+    fi
+fi
+
 install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 "$RUNNER_DIR"
 cd "$RUNNER_DIR"
 
@@ -69,6 +90,9 @@ fi
 
 if [ ! -f "$RUNNER_DIR/.service" ]; then
     "$RUNNER_DIR/svc.sh" install "$RUNNER_USER"
+elif [ "$in_docker_group" -eq 0 ] && getent group docker >/dev/null 2>&1; then
+    echo "Restarting runner service so the docker group applies"
+    "$RUNNER_DIR/svc.sh" stop || true
 fi
 "$RUNNER_DIR/svc.sh" start || true
 
