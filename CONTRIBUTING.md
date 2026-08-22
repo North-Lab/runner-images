@@ -21,7 +21,7 @@ Please note that this project is released with a [Contributor Code of Conduct][c
 1. [Fork][fork] and clone the repository.
 1. Create a new branch: `git checkout -b my-branch-name`.
 1. Make your changes, ensuring that they include steps to install, validate post-install, and update the software report (please see [Adding a new tool to an image](#adding-a-new-tool-to-an-image) for details).
-1. Test your changes by [creating an image and deploying a VM](docs/create-image-and-azure-resources.md).
+1. Test your changes by [creating an image and deploying a VM](docs/create-image-and-azure-resources.md) (Azure) or by [building a Proxmox template](docs/create-image-and-proxmox-resources.md) (Ubuntu 26.04).
 1. Push to your fork and [submit a pull request][pr].
 
 Here are a few things you can do that will increase the likelihood of your pull request being accepted:

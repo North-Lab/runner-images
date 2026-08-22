@@ -397,3 +397,7 @@ launch.json
 
 # Ignore dynamic template
 images/*/*-temp.json
+
+# Local Proxmox Packer variable files (may contain API tokens)
+*.auto.pkrvars.hcl
+images/ubuntu/templates-proxmox/proxmox.pkrvars.hcl
