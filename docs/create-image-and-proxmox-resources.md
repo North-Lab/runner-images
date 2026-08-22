@@ -278,6 +278,14 @@ systemctl restart 'actions.runner.*.service'
 
 Confirm with `id runner` (should list `docker`) and `sg docker -c 'docker info'`. Re-running `deploy` also adds the group and restarts the service when the user was not already a member.
 
+Docker/root leftover files in the runner workspace can make checkout fail with `EACCES unlink .../APKINDEX.tar.gz`. New deploys create `/opt/actions-runner/_work` as `runner` and install an `ACTIONS_RUNNER_HOOK_JOB_STARTED` hook that `chown -R`s that tree (via a NOPASSWD sudo wrapper limited to that script). **Already-deployed VMs** do not need a redeploy for the immediate fix:
+
+```bash
+chown -R runner:runner /opt/actions-runner/_work
+```
+
+Re-running `deploy` (or guest-setup) installs the hook so later jobs clean leftovers automatically.
+
 Default labels: `self-hosted,linux,x64,ubuntu-26.04`. Add extras with `[github].extra_labels` or `--labels`.
 
 Existing VMs with the same name are reused (not recloned). Guests that already have `/opt/actions-runner/.runner` skip `config.sh`. Online GitHub registrations with that name are left in place; guest setup still starts the service if needed.
@@ -334,3 +342,4 @@ Azure CLI, azcopy, and other tools from the upstream toolset are still installed
 - **Fleet deploy: HTTP 401/403 on agent/ping** — the guest agent is often fine (`qm agent <vmid> ping` works). The Packer API token lacks guest-agent privileges. Add the `RunnerFleet` role above and re-run; do not wait out the 30 minute timeout. The CLI POSTs `agent/ping` (PVE registers ping as POST) and falls back to GET.
 - **Fleet deploy: GitHub registration token failed** — the PAT in `GITHUB_TOKEN` needs repo administration (repo runners) or org runner admin (org URL). The PAT is not the runner registration token; the tool mints those per VM.
 - **Fleet jobs: permission denied on docker.sock** — the Cloud-Init user `runner` was not in the `docker` group (the image installs Docker for the Packer build user, which is deprovisioned). New deploys add `runner` to `docker` in `guest-setup.sh` before `svc.sh` starts. On existing VMs: `usermod -aG docker runner` then `systemctl restart 'actions.runner.*.service'`. Group changes do not apply to an already-running runner process. Do not recreate the VMs.
+- **Fleet jobs: EACCES unlink under `_work`** — leftover files owned by root (often from Docker). Immediate fix on an already-deployed VM: `chown -R runner:runner /opt/actions-runner/_work`. New guest-setup installs a job-started hook that repeats that chown before each job.

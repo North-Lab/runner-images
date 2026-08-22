@@ -64,7 +64,8 @@ if [ "$in_docker_group" -eq 0 ]; then
     fi
 fi
 
-install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 "$RUNNER_DIR"
+install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 "$RUNNER_DIR" "${RUNNER_DIR}/_work"
+chown -R "$RUNNER_USER:$RUNNER_USER" "${RUNNER_DIR}/_work"
 cd "$RUNNER_DIR"
 
 if [ ! -x "$RUNNER_DIR/config.sh" ]; then
@@ -88,10 +89,69 @@ else
         --replace
 fi
 
+# Docker/root leftover files in _work cause EACCES on checkout unlink.
+# guest-setup runs as root; the job-started hook uses a NOPASSWD sudo
+# wrapper so the runner user can chown before each job.
+WORK_DIR="${RUNNER_DIR}/_work"
+HOOK_DIR="${RUNNER_DIR}/hooks"
+HOOK_SCRIPT="${HOOK_DIR}/job-started.sh"
+CHOWN_BIN="/usr/local/sbin/actions-runner-chown-work"
+SUDOERS="/etc/sudoers.d/actions-runner-work"
+hook_restart=0
+
+install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0755 "$WORK_DIR" "$HOOK_DIR"
+chown -R "$RUNNER_USER:$RUNNER_USER" "$WORK_DIR"
+echo "Ensured ${WORK_DIR} is owned by ${RUNNER_USER}"
+
+cat >"$CHOWN_BIN" <<EOF
+#!/bin/bash
+set -euo pipefail
+# Fleet-installed. Only the runner _work tree; invoked via sudo from the hook.
+WORK='$WORK_DIR'
+OWNER='$RUNNER_USER'
+mkdir -p "\$WORK"
+chown -R "\$OWNER:\$OWNER" "\$WORK"
+EOF
+chmod 0755 "$CHOWN_BIN"
+chown root:root "$CHOWN_BIN"
+
+cat >"$HOOK_SCRIPT" <<EOF
+#!/bin/bash
+set -euo pipefail
+sudo --non-interactive $CHOWN_BIN
+EOF
+chmod 0755 "$HOOK_SCRIPT"
+chown "$RUNNER_USER:$RUNNER_USER" "$HOOK_SCRIPT"
+
+cat >"$SUDOERS" <<EOF
+Defaults:${RUNNER_USER} !requiretty
+${RUNNER_USER} ALL=(root) NOPASSWD: ${CHOWN_BIN}
+EOF
+chmod 0440 "$SUDOERS"
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$SUDOERS"; then
+    echo "invalid sudoers ${SUDOERS}" >&2
+    exit 1
+fi
+
+ENV_RUNNER="${RUNNER_DIR}/.env"
+touch "$ENV_RUNNER"
+wanted="ACTIONS_RUNNER_HOOK_JOB_STARTED=${HOOK_SCRIPT}"
+if ! grep -qxF "$wanted" "$ENV_RUNNER"; then
+    if grep -q '^ACTIONS_RUNNER_HOOK_JOB_STARTED=' "$ENV_RUNNER"; then
+        sed -i "s|^ACTIONS_RUNNER_HOOK_JOB_STARTED=.*|${wanted}|" "$ENV_RUNNER"
+    else
+        echo "$wanted" >>"$ENV_RUNNER"
+    fi
+    hook_restart=1
+    echo "Set ${wanted}"
+fi
+chown "$RUNNER_USER:$RUNNER_USER" "$ENV_RUNNER"
+chmod 0644 "$ENV_RUNNER"
+
 if [ ! -f "$RUNNER_DIR/.service" ]; then
     "$RUNNER_DIR/svc.sh" install "$RUNNER_USER"
-elif [ "$in_docker_group" -eq 0 ] && getent group docker >/dev/null 2>&1; then
-    echo "Restarting runner service so the docker group applies"
+elif { [ "$in_docker_group" -eq 0 ] && getent group docker >/dev/null 2>&1; } || [ "$hook_restart" -eq 1 ]; then
+    echo "Restarting runner service so docker group / job hook apply"
     "$RUNNER_DIR/svc.sh" stop || true
 fi
 "$RUNNER_DIR/svc.sh" start || true
