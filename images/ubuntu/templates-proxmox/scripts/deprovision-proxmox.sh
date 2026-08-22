@@ -41,6 +41,23 @@ fi
 systemctl enable qemu-guest-agent
 systemctl start qemu-guest-agent || true
 
+# Ubuntu 26 / cloud-init 25+ has no cloud-init.service. The package plus the
+# systemd generator enable cloud-init.target. Enable only units that exist
+# and declare [Install] (do not start them while sealing the template).
+# Missing or non-installable names are skipped; enable of an existing
+# installable unit still fails the script.
+enable_cloud_init_units() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local u
+    for u in cloud-init-main.service cloud-init-local.service cloud-init-network.service \
+             cloud-config.service cloud-final.service cloud-init.service; do
+        systemctl cat "$u" >/dev/null 2>&1 || continue
+        systemctl cat "$u" | grep -F '[Install]' >/dev/null || continue
+        systemctl enable "$u"
+    done
+}
+enable_cloud_init_units
+
 if command -v cloud-init >/dev/null 2>&1; then
     cloud-init clean --logs --seed || cloud-init clean --logs
 fi

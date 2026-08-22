@@ -35,4 +35,10 @@ autoinstall:
     - echo 'packer ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/packer
     - chmod 440 /target/etc/sudoers.d/packer
     - curtin in-target --target=/target -- systemctl enable qemu-guest-agent
-    - curtin in-target --target=/target -- systemctl enable cloud-init
+    # Do not `systemctl enable cloud-init`. Ubuntu 26 / cloud-init 25+ no longer
+    # ships cloud-init.service; that command exits 1 and aborts Subiquity.
+    # The cloud-init package (listed above) plus the systemd generator enable
+    # cloud-init.target and the real units (cloud-init-main.service,
+    # cloud-init-local.service, cloud-init-network.service, cloud-config.service,
+    # cloud-final.service). deprovision-proxmox.sh re-enables any of those that
+    # exist and declare [Install] before the VM is converted to a template.

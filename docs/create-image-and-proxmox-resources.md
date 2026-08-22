@@ -217,6 +217,7 @@ Azure CLI, azcopy, and other tools from the upstream toolset are still installed
 ## Troubleshooting
 
 - **Autoinstall sits on the GRUB or language screen** — Packer's HTTP server is not reachable (`autoinstall_delivery = "http"`). Set `http_bind_address` to a VM-reachable IP, open the HTTP port range, or switch to `autoinstall_delivery = "iso"`.
+- **`systemctl enable cloud-init` fails in autoinstall late-commands** — Ubuntu 26 / cloud-init 25+ no longer ships `cloud-init.service`. Units are `cloud-init-main.service`, `cloud-init-local.service`, `cloud-init-network.service`, `cloud-config.service`, `cloud-final.service`, and `cloud-init.target` (enabled by the systemd generator when the `cloud-init` package is installed). `http/user-data` does not enable `cloud-init`; `deprovision-proxmox.sh` enables only units that exist and have an `[Install]` section. Do not add `systemctl enable cloud-init` back to late-commands.
 - **Clones boot back into the installer** — leftover autoinstall kernel args. Confirm the build ran `deprovision-proxmox.sh` (it strips `autoinstall` / `ds=nocloud*` from GRUB).
 - **Packer cannot find the guest IP** — install/enable `qemu-guest-agent` (autoinstall does this) and keep `qemu_agent = true`. Check the VM has a DHCP address on `network_bridge`.
 - **API errors creating disks or ISOs** — token ACL, wrong `proxmox_node`, or a storage pool that does not allow the requested content type (`iso` vs `images`).
