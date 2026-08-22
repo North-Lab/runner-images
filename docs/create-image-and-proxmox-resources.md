@@ -92,7 +92,7 @@ iso_checksum     = "file:https://releases.ubuntu.com/26.04/SHA256SUMS"
 From the repository root:
 
 ```bash
-cp images/ubuntu/templates-proxmox/proxmox.pkrvars.hcl.example \
+cp images/ubuntu/templates-proxmox/example.pkrvars.hcl \
    images/ubuntu/templates-proxmox/proxmox.pkrvars.hcl
 ```
 
@@ -119,7 +119,7 @@ To build only this image if you later add more builds to the directory:
 packer build -only 'ubuntu-26_04.proxmox-iso.ubuntu' -var-file=proxmox.pkrvars.hcl .
 ```
 
-After a successful build, Proxmox shows a template named `template_name` (default `ubuntu-26.04-runner`) on `proxmox_node`. Packer converts the VM to a template automatically.
+After a successful build, Proxmox shows a template named `template_name` (default `ubuntu-2604-runner`) on `proxmox_node`. Packer converts the VM to a template automatically.
 
 ### Autoinstall delivery
 

@@ -54,7 +54,7 @@ variable "proxmox_task_timeout" {
 // VM / template identity
 variable "vm_name" {
   type        = string
-  default     = "ubuntu-26_04-runner"
+  default     = "ubuntu-2604-runner"
   description = "Name of the temporary build VM."
 }
 
@@ -66,7 +66,7 @@ variable "vm_id" {
 
 variable "template_name" {
   type        = string
-  default     = "ubuntu-26.04-runner"
+  default     = "ubuntu-2604-runner"
   description = "Name of the Proxmox VM template created at the end of the build."
 }
 
@@ -295,7 +295,7 @@ variable "autoinstall_delivery" {
   description = "How to deliver Ubuntu autoinstall: http (Packer HTTP server) or iso (cidata seed ISO)."
   validation {
     condition     = contains(["http", "iso"], var.autoinstall_delivery)
-    error_message = "autoinstall_delivery must be \"http\" or \"iso\"."
+    error_message = "The autoinstall_delivery value must be http or iso."
   }
 }
 

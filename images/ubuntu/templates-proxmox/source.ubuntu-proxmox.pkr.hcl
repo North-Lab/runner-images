@@ -8,31 +8,31 @@ source "proxmox-iso" "ubuntu" {
   pool                     = var.proxmox_pool != "" ? var.proxmox_pool : null
   task_timeout             = var.proxmox_task_timeout
 
-  vm_name              = var.vm_name
-  vm_id                = var.vm_id
-  tags                 = var.template_tags
-  template_name        = var.template_name
-  template_description = local.template_description
+  vm_name                  = var.vm_name
+  vm_id                    = var.vm_id
+  tags                     = var.template_tags
+  template_name            = var.template_name
+  template_description     = local.template_description
   skip_convert_to_template = var.skip_convert_to_template
 
-  os              = "l26"
-  bios            = var.bios
-  machine         = var.machine
-  qemu_agent      = var.qemu_agent
-  scsi_controller = var.scsi_controller
-  cores           = var.vm_cores
-  sockets         = var.vm_sockets
-  cpu_type        = var.vm_cpu_type
-  memory          = var.vm_memory
+  os                 = "l26"
+  bios               = var.bios
+  machine            = var.machine
+  qemu_agent         = var.qemu_agent
+  scsi_controller    = var.scsi_controller
+  cores              = var.vm_cores
+  sockets            = var.vm_sockets
+  cpu_type           = var.vm_cpu_type
+  memory             = var.vm_memory
   ballooning_minimum = var.vm_ballooning_minimum
-  onboot          = false
+  onboot             = false
 
   dynamic "efi_config" {
     for_each = var.bios == "ovmf" ? [1] : []
     content {
-      efi_storage_pool    = var.disk_storage_pool
-      efi_type            = var.efi_type
-      pre_enrolled_keys   = var.efi_pre_enrolled_keys
+      efi_storage_pool  = var.disk_storage_pool
+      efi_type          = var.efi_type
+      pre_enrolled_keys = var.efi_pre_enrolled_keys
     }
   }
 
@@ -92,9 +92,9 @@ source "proxmox-iso" "ubuntu" {
   boot_wait    = var.boot_wait
   boot_command = local.boot_command
 
-  ssh_username           = var.ssh_username
-  ssh_password           = var.ssh_password
-  ssh_timeout            = var.ssh_timeout
-  ssh_handshake_attempts = var.ssh_handshake_attempts
+  ssh_username              = var.ssh_username
+  ssh_password              = var.ssh_password
+  ssh_timeout               = var.ssh_timeout
+  ssh_handshake_attempts    = var.ssh_handshake_attempts
   ssh_clear_authorized_keys = var.ssh_clear_authorized_keys
 }
