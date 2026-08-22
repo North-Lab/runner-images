@@ -205,6 +205,14 @@ Install and register [actions/runner](https://github.com/actions/runner) on the 
   - Repo runners: classic `repo` scope (or fine-grained Administration: Read and write).
   - Org runners: classic `admin:org` (or Organization self-hosted runners).
 - qemu-guest-agent working on clones (the template enables it). The tool execs as root through the agent; SSH is optional.
+- The Packer token can usually clone and start VMs but **not** talk to the guest agent. Fleet deploy needs extra privileges (PVE 9 guest-agent ACL, or `VM.Monitor` on PVE 8). `qm agent <vmid> ping` uses root on the node and can succeed while the API token gets HTTP 401/403.
+
+```bash
+pveum role add RunnerFleet -privs "VM.GuestAgent.Audit,VM.GuestAgent.FileRead,VM.GuestAgent.FileWrite,VM.GuestAgent.Unrestricted"
+pveum acl modify / --token 'packer@pve!imagegen' --role RunnerFleet
+```
+
+Replace `packer@pve!imagegen` with the token id you put in `PROXMOX_USERNAME`. On PVE 8, grant `VM.Monitor` instead of the `VM.GuestAgent.*` names if those privileges do not exist. The CLI POSTs `/nodes/{node}/qemu/{vmid}/agent/ping` (GET fallback) and exits immediately on 401/403 instead of retrying.
 
 Do not commit tokens. Copy the example config:
 
@@ -242,73 +250,9 @@ python3 tools/proxmox-runners/proxmox-runners.py nodes --config tools/proxmox-ru
 export PROXMOX_URL PROXMOX_USERNAME PROXMOX_TOKEN
 export GITHUB_TOKEN
 
-python3 tools/proxmox-runners/proxmox-runners.py deploy \
-  --config tools/proxmox-runners/fleet.toml \
+python3 tools/proxmox-runners/proxmox-runners.py deploy \\
+  --config tools/proxmox-runners/fleet.toml \\
   --count 6
 ```
 
-For each VM the tool:
-
-1. Allocates a unique VMID (`cluster/nextid`, or `[vm].vmid_start`).
-2. Full-clones the template (or the per-node replica).
-3. Applies Cloud-Init (`ciuser`, optional SSH key, `ip=dhcp` or `ip=192.168.1.{n}/24,gw=...`).
-4. Starts the VM and waits for qemu-guest-agent.
-5. Runs `/opt/post-generation` as root (once per VM; stamped with `.fleet-done`).
-6. Downloads `actions/runner` **linux-x64** (latest release unless `runner_version` is pinned).
-7. Registers with a **fresh** registration token (`POST .../actions/runners/registration-token`) for the repo or org in `[github].url`.
-8. Installs the systemd service with `svc.sh install` / `svc.sh start` as `ciuser` (default `runner`).
-
-Default labels: `self-hosted,linux,x64,ubuntu-26.04`. Add extras with `[github].extra_labels` or `--labels`.
-
-Existing VMs with the same name are reused (not recloned). Guests that already have `/opt/actions-runner/.runner` skip `config.sh`. Online GitHub registrations with that name are left in place; guest setup still starts the service if needed.
-
-```bash
-python3 tools/proxmox-runners/proxmox-runners.py status --config tools/proxmox-runners/fleet.toml
-```
-
-### Teardown
-
-```bash
-python3 tools/proxmox-runners/proxmox-runners.py destroy \
-  --config tools/proxmox-runners/fleet.toml \
-  --yes
-```
-
-Stops and deletes VMs whose names start with `name_prefix` (default `gh-runner-`) and removes matching GitHub runner registrations. `--count N` limits that to `gh-runner-01` … `N`. `--keep-github` leaves GitHub registrations. Packer templates (including per-node replicas named `ubuntu-2604-runner-<node>`) are not deleted.
-
-## Post-generation scripts
-
-The same Ubuntu post-generation scripts as Azure are installed at `/opt/post-generation`. Run them on **each clone** as root after first boot, once Cloud-Init has created the runner user:
-
-```bash
-sudo su -c "find /opt/post-generation -mindepth 1 -maxdepth 1 -type f -name '*.sh' -exec bash {} \;"
-```
-
-Details are in [create-image-and-azure-resources.md](create-image-and-azure-resources.md#post-generation-scripts).
-
-## How this differs from Azure
-
-| Topic | Azure | Proxmox |
-| ----- | ----- | ------- |
-| Packer directory | `images/ubuntu/templates` | `images/ubuntu/templates-proxmox` |
-| Builder | `azure-arm` | `proxmox-iso` |
-| Base OS | Canonical marketplace image | Ubuntu 26.04 live-server ISO + autoinstall |
-| Final cleanup | `waagent -force -deprovision+user` | `deprovision-proxmox.sh` |
-| Artifact | Azure managed image / gallery version | Proxmox VM template |
-| Guest agent | waagent | qemu-guest-agent |
-
-Azure CLI, azcopy, and other tools from the upstream toolset are still installed. They are not Azure-only bootstrap.
-
-## Troubleshooting
-
-- **Autoinstall sits on the GRUB or language screen** — Packer's HTTP server is not reachable (`autoinstall_delivery = "http"`). Set `http_bind_address` to a VM-reachable IP, open the HTTP port range, or switch to `autoinstall_delivery = "iso"`.
-- **`systemctl enable cloud-init` fails in autoinstall late-commands** — Ubuntu 26 / cloud-init 25+ no longer ships `cloud-init.service`. Units are `cloud-init-main.service`, `cloud-init-local.service`, `cloud-init-network.service`, `cloud-config.service`, `cloud-final.service`, and `cloud-init.target` (enabled by the systemd generator when the `cloud-init` package is installed). `http/user-data` does not enable `cloud-init`; `deprovision-proxmox.sh` enables only units that exist and have an `[Install]` section. Do not add `systemctl enable cloud-init` back to late-commands.
-- **Clones boot back into the installer** — leftover autoinstall kernel args. Confirm the build ran `deprovision-proxmox.sh` (it strips `autoinstall` / `ds=nocloud*` from GRUB).
-- **Packer cannot find the guest IP** — install/enable `qemu-guest-agent` (autoinstall does this) and keep `qemu_agent = true`. Check the VM has a DHCP address on `network_bridge`.
-- **API errors creating disks or ISOs** — token ACL, wrong `proxmox_node`, or a storage pool that does not allow the requested content type (`iso` vs `images`).
-- **Out of space during provisioners** — raise `disk_size` above `75G`. The runner image is close to the Azure 75 GiB default.
-- **OOM during provisioners** — raise `vm_memory`. 16 GiB matches the Azure build size.
-- **`packer validate` on Azure templates** — keep using `images/ubuntu/templates`. The Proxmox plugin is only required under `images/ubuntu/templates-proxmox`, so Azure CI does not need it.
-- **Fleet deploy: node cannot receive a disk** — `[proxmox].storage` must exist on that node with `images` content. For `local-lvm`, create the same storage id on every node. Shared storage must be mounted on every target.
-- **Fleet deploy: qemu-guest-agent timeout** — first boot of this image is slow (cloud-init). The CLI waits up to 30 minutes and logs a heartbeat every ~30s. Each ping uses a short HTTP timeout so a down agent does not hang the API call. If the wait fails, the VM can still be running: on the node run `qm agent <vmid> ping`, and in the guest `systemctl status qemu-guest-agent`. Re-run `deploy`; existing VMs are reused by name.
-- **Fleet deploy: GitHub registration token failed** — the PAT in `GITHUB_TOKEN` needs repo administration (repo runners) or org runner admin (org URL). The PAT is not the runner registration token; the tool mints those per VM.
+PLACEHOLDER_REST
