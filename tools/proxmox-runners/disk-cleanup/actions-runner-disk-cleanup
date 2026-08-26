@@ -1,0 +1,222 @@
+#!/bin/bash
+# Idle disk cleanup for self-hosted GitHub Actions runners.
+# Never interrupt a running job (Runner.Worker). Always uncordon the runner
+# service, even when a cleanup step fails.
+set -euo pipefail
+
+THRESHOLD="${DISK_CLEANUP_THRESHOLD:-70}"
+RUNNER_DIR="${RUNNER_DIR:-/opt/actions-runner}"
+RUNNER_USER="${RUNNER_USER:-runner}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/var/lib/docker}"
+LOCK_FILE="${LOCK_FILE:-/run/actions-runner-disk-cleanup.lock}"
+IF_PRESSURE=0
+
+log() {
+    echo "actions-runner-disk-cleanup: $*"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: actions-runner-disk-cleanup [--if-pressure]
+
+  (default)       Clean when the runner is idle (6h timer).
+  --if-pressure   Clean only when idle AND disk use is >= 70% on the
+                  filesystems that hold the runner directory or Docker data.
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --if-pressure) IF_PRESSURE=1 ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --threshold=*)
+            THRESHOLD="${arg#--threshold=}"
+            ;;
+        *)
+            log "unknown argument: $arg" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+job_running() {
+    # Runner.Worker is the Actions job process. Runner.Listener stays up while
+    # idle and must not be treated as a running job.
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -x Runner.Worker >/dev/null 2>&1; then
+            return 0
+        fi
+        if pgrep -f '[R]unner.Worker' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+usage_pct_for_path() {
+    local path="$1"
+    while [ -n "$path" ] && [ "$path" != "/" ] && [ ! -e "$path" ]; do
+        path=$(dirname "$path")
+    done
+    [ -e "$path" ] || path=/
+    df -P "$path" 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); if ($5 ~ /^[0-9]+$/) print $5 }'
+}
+
+docker_data_paths() {
+    local root=""
+    if command -v docker >/dev/null 2>&1; then
+        root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+    fi
+    if [ -n "$root" ]; then
+        printf '%s\n' "$root"
+    elif [ -e "$DOCKER_DATA_ROOT" ]; then
+        printf '%s\n' "$DOCKER_DATA_ROOT"
+    fi
+}
+
+disk_over_threshold() {
+    local path pct
+    local -a paths=("$RUNNER_DIR")
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        paths+=("$path")
+    done < <(docker_data_paths)
+
+    for path in "${paths[@]}"; do
+        pct=$(usage_pct_for_path "$path" || true)
+        [ -n "${pct:-}" ] || continue
+        if [ "$pct" -ge "$THRESHOLD" ]; then
+            log "filesystem for ${path} is ${pct}% full (>= ${THRESHOLD}%)"
+            return 0
+        fi
+        log "filesystem for ${path} is ${pct}% full (below ${THRESHOLD}%)"
+    done
+    return 1
+}
+
+list_runner_units() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl list-units --type=service --all --no-legend --no-pager --plain 'actions.runner.*' 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -E '^actions\.runner\..+\.service$' || true
+}
+
+CORDONED_UNITS=()
+uncordon() {
+    local unit
+    for unit in "${CORDONED_UNITS[@]+"${CORDONED_UNITS[@]}"}"; do
+        log "starting ${unit}"
+        systemctl start "$unit" || log "warning: failed to start ${unit}"
+    done
+}
+
+install -d -m 0755 "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "another cleanup is already running; skip"
+    exit 0
+fi
+
+if job_running; then
+    log "job running (Runner.Worker); skip"
+    exit 0
+fi
+
+if [ "$IF_PRESSURE" -eq 1 ]; then
+    if ! disk_over_threshold; then
+        log "disk below ${THRESHOLD}% on runner/Docker filesystems; skip"
+        exit 0
+    fi
+    if job_running; then
+        log "job running after disk check; skip"
+        exit 0
+    fi
+fi
+
+if job_running; then
+    log "job running on re-check; skip"
+    exit 0
+fi
+
+trap uncordon EXIT
+
+mapfile -t CORDONED_UNITS < <(list_runner_units)
+if [ "${#CORDONED_UNITS[@]}" -gt 0 ]; then
+    log "idle confirmed; cordoning ${CORDONED_UNITS[*]}"
+    if job_running; then
+        log "job running immediately before cordon; skip"
+        CORDONED_UNITS=()
+        exit 0
+    fi
+    local_unit=""
+    for local_unit in "${CORDONED_UNITS[@]}"; do
+        systemctl stop "$local_unit" || log "warning: failed to stop ${local_unit}"
+    done
+else
+    log "no actions.runner.*.service units loaded; continuing without cordon"
+fi
+
+if job_running; then
+    log "job still present after cordon; skip cleanup (will uncordon)"
+    exit 0
+fi
+
+cleanup_diag() {
+    local diag="${RUNNER_DIR}/_diag"
+    [ -d "$diag" ] || return 0
+    log "cleaning ${diag} logs"
+    find "$diag" -type f \( -name '*.log' -o -name '*.log.*' -o -name 'Worker_*' -o -name 'Runner_*' \) -delete || true
+    find "$diag" -type f -delete || true
+}
+
+cleanup_work() {
+    local work="${RUNNER_DIR}/_work"
+    [ -d "$work" ] || return 0
+    log "removing leftover safe job dirs under ${work}"
+    local entry name
+    # Reserved runner internals under _work. Job workspaces (_temp, repo dirs,
+    # _actions) are leftover once idle + cordoned.
+    for entry in "$work"/* "$work"/.[!.]* "$work"/..?*; do
+        [ -e "$entry" ] || continue
+        name=$(basename "$entry")
+        case "$name" in
+            _tool|_update) continue ;;
+        esac
+        rm -rf "$entry" || log "warning: failed to remove ${entry}"
+    done
+    mkdir -p "$work"
+}
+
+cleanup_docker() {
+    command -v docker >/dev/null 2>&1 || return 0
+    if ! docker info >/dev/null 2>&1; then
+        log "docker is installed but the daemon is not reachable; skip docker prune"
+        return 0
+    fi
+    log "pruning leftover docker containers, builder cache, and unused images"
+    docker container prune -f || log "warning: docker container prune failed"
+    docker builder prune -af || log "warning: docker builder prune failed"
+    docker image prune -af || log "warning: docker image prune failed"
+}
+
+chown_work() {
+    local work="${RUNNER_DIR}/_work"
+    mkdir -p "$work"
+    if id "$RUNNER_USER" >/dev/null 2>&1; then
+        log "chown -R ${RUNNER_USER}:${RUNNER_USER} ${work}"
+        chown -R "$RUNNER_USER:$RUNNER_USER" "$work" || log "warning: chown ${work} failed"
+    else
+        log "user ${RUNNER_USER} does not exist; skip chown"
+    fi
+}
+
+cleanup_diag || log "warning: _diag cleanup failed"
+cleanup_work || log "warning: _work cleanup failed"
+cleanup_docker || log "warning: docker cleanup failed"
+chown_work || log "warning: _work chown failed"
+
+log "cleanup finished; runner service will be started by EXIT trap"

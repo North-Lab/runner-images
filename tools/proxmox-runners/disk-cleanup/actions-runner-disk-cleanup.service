@@ -1,0 +1,16 @@
+[Unit]
+Description=GitHub Actions runner idle disk cleanup
+Documentation=file:///opt/actions-runner
+After=local-fs.target
+# Do not Conflict= the runner service; this unit cordons it from ExecStart.
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/actions-runner-disk-cleanup
+ExecStart=/usr/local/sbin/actions-runner-disk-cleanup
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

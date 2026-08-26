@@ -1,0 +1,14 @@
+[Unit]
+Description=Run idle runner disk cleanup every 6 hours
+Requires=actions-runner-disk-cleanup.service
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=10min
+AccuracySec=1min
+Unit=actions-runner-disk-cleanup.service
+
+[Install]
+WantedBy=timers.target

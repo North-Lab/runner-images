@@ -14,6 +14,7 @@ Upstream Azure-only instructions remain in [create-image-and-azure-resources.md]
 - [Optional variables](#optional-variables)
 - [Clone the template into a runner VM](#clone-the-template-into-a-runner-vm)
 - [Deploy a runner fleet](#deploy-a-runner-fleet)
+- [Automatic disk cleanup](#automatic-disk-cleanup)
 - [Post-generation scripts](#post-generation-scripts)
 - [How this differs from Azure](#how-this-differs-from-azure)
 - [Troubleshooting](#troubleshooting)
@@ -28,7 +29,7 @@ Packer uses the [hashicorp/proxmox](https://developer.hashicorp.com/packer/integ
 4. Seal the guest (cloud-init reset, machine-id, qemu-guest-agent) instead of `waagent -deprovision`.
 5. Convert the VM to a Proxmox template (unless `skip_convert_to_template` is set).
 
-Clone that template for each self-hosted runner. Do not run jobs on the template itself.
+The template enables an idle disk-cleanup systemd timer (6 hours, plus a 15-minute check when disk is at least 70%). See [Automatic disk cleanup](#automatic-disk-cleanup). Clone that template for each self-hosted runner. Do not run jobs on the template itself.
 
 Ubuntu 26.04 **x86_64** is the supported Proxmox path. Arm64 on Proxmox is not wired up.
 
@@ -265,6 +266,7 @@ For each VM the tool:
 6. Downloads `actions/runner` **linux-x64** (latest release unless `runner_version` is pinned).
 7. Registers with a **fresh** registration token (`POST .../actions/runners/registration-token`) for the repo or org in `[github].url`.
 8. Adds `ciuser` (default `runner`) to the `docker` group if Docker is installed, then installs the systemd service with `svc.sh install` / `svc.sh start`.
+9. Installs the idle disk-cleanup oneshot + timers (`actions-runner-disk-cleanup.timer` every 6 hours, `actions-runner-disk-cleanup-pressure.timer` every 15 minutes when disk is at least 70%). Already-deployed VMs pick this up on the next `deploy` / guest-setup. The job-started `_work` chown hook is unchanged.
 
 Proxmox Cloud-Init (`ciuser`) cannot set supplementary groups. guest-setup is the reliable path so Actions jobs can use `unix:///var/run/docker.sock`.
 
@@ -289,6 +291,32 @@ Re-running `deploy` (or guest-setup) installs the hook so later jobs clean lefto
 Default labels: `self-hosted,linux,x64,ubuntu-26.04`. Add extras with `[github].extra_labels` or `--labels`.
 
 Existing VMs with the same name are reused (not recloned). Guests that already have `/opt/actions-runner/.runner` skip `config.sh`. Online GitHub registrations with that name are left in place; guest setup still starts the service if needed.
+
+## Automatic disk cleanup
+
+Self-hosted clones fill `/opt/actions-runner/_work`, `_diag`, and Docker storage across jobs. The image and guest-setup install a systemd oneshot that **never interrupts a running job**:
+
+1. A 6-hour timer always tries to clean when idle.
+2. A 15-minute timer cleans only when idle **and** utilization is at least 70% on the filesystems that hold `/opt/actions-runner` or Docker data (`docker info` root, else `/var/lib/docker`).
+3. If `Runner.Worker` is running, the script exits 0.
+4. After idle is confirmed, it re-checks, then stops `actions.runner.*.service` (cordon) so a new job cannot land mid-clean.
+5. While cordoned it removes `_diag` logs, leftover safe `_work` job dirs (`_temp`, `_actions`, repo workspaces — not `_tool` / `_update`), leftover Docker containers / builder cache / unused images when Docker is present, and `chown -R runner:runner /opt/actions-runner/_work` (`ciuser`). It does **not** delete `.runner`, `bin/`, or `svc.sh` / `.service`.
+6. An `EXIT` trap always starts the runner service again, even if a cleanup step fails.
+
+Units: `actions-runner-disk-cleanup.service` / `.timer` and `actions-runner-disk-cleanup-pressure.service` / `.timer`. Script: `/usr/local/sbin/actions-runner-disk-cleanup`. Defaults: `/etc/default/actions-runner-disk-cleanup`.
+
+- **New templates:** Packer copies `tools/proxmox-runners/disk-cleanup/` and runs `install.sh` with `START_TIMERS=0` (enable on boot, do not fire during the image build) just before `deprovision-proxmox.sh`.
+- **Existing clones:** re-run `deploy` (or guest-setup). The fleet CLI uploads the same files; guest-setup also has a bundled copy so a lone `guest-setup.sh` still installs the timers.
+
+The `ACTIONS_RUNNER_HOOK_JOB_STARTED` `_work` chown hook from guest-setup is separate and is left in place.
+
+Manual run (idle only; skips if a job is running):
+
+```bash
+sudo /usr/local/sbin/actions-runner-disk-cleanup
+sudo /usr/local/sbin/actions-runner-disk-cleanup --if-pressure
+systemctl list-timers 'actions-runner-disk-cleanup*'
+```
 
 ```bash
 python3 tools/proxmox-runners/proxmox-runners.py status --config tools/proxmox-runners/fleet.toml
@@ -342,4 +370,5 @@ Azure CLI, azcopy, and other tools from the upstream toolset are still installed
 - **Fleet deploy: HTTP 401/403 on agent/ping** — the guest agent is often fine (`qm agent <vmid> ping` works). The Packer API token lacks guest-agent privileges. Add the `RunnerFleet` role above and re-run; do not wait out the 30 minute timeout. The CLI POSTs `agent/ping` (PVE registers ping as POST) and falls back to GET.
 - **Fleet deploy: GitHub registration token failed** — the PAT in `GITHUB_TOKEN` needs repo administration (repo runners) or org runner admin (org URL). The PAT is not the runner registration token; the tool mints those per VM.
 - **Fleet jobs: permission denied on docker.sock** — the Cloud-Init user `runner` was not in the `docker` group (the image installs Docker for the Packer build user, which is deprovisioned). New deploys add `runner` to `docker` in `guest-setup.sh` before `svc.sh` starts. On existing VMs: `usermod -aG docker runner` then `systemctl restart 'actions.runner.*.service'`. Group changes do not apply to an already-running runner process. Do not recreate the VMs.
-- **Fleet jobs: EACCES unlink under `_work`** — leftover files owned by root (often from Docker). Immediate fix on an already-deployed VM: `chown -R runner:runner /opt/actions-runner/_work`. New guest-setup installs a job-started hook that repeats that chown before each job.
+- **Fleet jobs: EACCES unlink under `_work`** — leftover files owned by root (often from Docker). Immediate fix on an already-deployed VM: `chown -R runner:runner /opt/actions-runner/_work`. New guest-setup installs a job-started hook that repeats that chown before each job. The idle disk-cleanup oneshot also chowns `_work` after it removes leftover job dirs.
+- **Fleet disk fills up** — confirm `systemctl list-timers 'actions-runner-disk-cleanup*'` and `journalctl -u actions-runner-disk-cleanup.service -u actions-runner-disk-cleanup-pressure.service`. Cleanup is skipped (exit 0) while `Runner.Worker` is running. Re-run guest-setup to install the timers on VMs that predate this unit. Do not delete `/opt/actions-runner/.runner` or `bin/`.

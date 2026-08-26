@@ -1,0 +1,15 @@
+[Unit]
+Description=GitHub Actions runner idle disk cleanup (only if disk >= 70%)
+Documentation=file:///opt/actions-runner
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/actions-runner-disk-cleanup
+ExecStart=/usr/local/sbin/actions-runner-disk-cleanup --if-pressure
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

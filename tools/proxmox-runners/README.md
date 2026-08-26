@@ -2,7 +2,7 @@
 
 Python CLI that clones the Ubuntu 26.04 Packer template across a Proxmox cluster and registers GitHub Actions runners.
 
-See [Deploy a runner fleet](../../docs/create-image-and-proxmox-resources.md#deploy-a-runner-fleet).
+See [Deploy a runner fleet](../../docs/create-image-and-proxmox-resources.md#deploy-a-runner-fleet) and [Automatic disk cleanup](../../docs/create-image-and-proxmox-resources.md#automatic-disk-cleanup).
 
 ```bash
 cp fleet.example.toml fleet.toml   # gitignored; do not commit tokens
