@@ -1,0 +1,59 @@
+# Example Packer variables for an Ubuntu 26.04 Proxmox runner-image build.
+# Copy to proxmox.pkrvars.hcl (gitignored) or pass -var / environment variables.
+# This file is an example only — do not put real tokens or lab hosts here.
+
+# --- Required: Proxmox API ---
+proxmox_url      = "https://pve.lab.example:8006/api2/json"
+proxmox_username = "packer@pve!imagegen"
+proxmox_token    = "00000000-0000-0000-0000-000000000000"
+# proxmox_password           = ""  # only if not using a token
+proxmox_insecure_skip_tls_verify = true
+proxmox_node                     = "pve"
+# proxmox_pool               = ""
+
+# --- Template identity ---
+# vm_id                      = 9000
+vm_name       = "ubuntu-2604-runner"
+template_name = "ubuntu-2604-runner"
+# template_description       = "Ubuntu 26.04 GitHub Actions runner"
+template_tags = "ubuntu-26.04;runner-images"
+
+# --- Compute / disk (build VM; clones can be resized) ---
+vm_cores          = 4
+vm_sockets        = 1
+vm_cpu_type       = "host"
+vm_memory         = 16384
+disk_storage_pool = "local-lvm"
+disk_size         = "75G"
+scsi_controller   = "virtio-scsi-pci"
+bios              = "ovmf"
+machine           = "q35"
+
+# --- Network ---
+network_bridge = "vmbr0"
+# network_vlan_tag           = "10"
+network_model = "virtio"
+
+# --- ISO ---
+# Prefer an ISO already uploaded to Proxmox storage:
+iso_file         = "local:iso/ubuntu-26.04-live-server-amd64.iso"
+iso_storage_pool = "local"
+iso_checksum     = "file:https://releases.ubuntu.com/26.04/SHA256SUMS"
+# Or let Packer download and upload the ISO (comment iso_file above):
+# iso_url                    = "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso"
+# iso_download_pve           = true
+
+# --- Autoinstall delivery ---
+# http: Packer HTTP server must be reachable from the VM (set http_bind_address).
+# iso:  attach a cidata seed ISO (use this when the VM cannot route to Packer).
+autoinstall_delivery = "http"
+http_bind_address    = "192.0.2.10"
+# http_interface             = "eth0"
+
+# --- Cloud-Init on the finished template ---
+cloud_init = true
+# cloud_init_storage_pool    = "local-lvm"
+
+# --- Image metadata (same meaning as Azure builds) ---
+image_os      = "ubuntu26"
+image_version = "dev"

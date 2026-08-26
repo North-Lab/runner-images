@@ -14,7 +14,7 @@
 ## About
 
 This repository contains the source code used to create the VM images for [GitHub-hosted runners](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners) used for Actions, as well as for [Microsoft-hosted agents](https://docs.microsoft.com/en-us/azure/devops/pipelines/agents/hosted?view=azure-devops#use-a-microsoft-hosted-agent) used for Azure Pipelines.
-To build a VM machine from this repo's source, see the [instructions](docs/create-image-and-azure-resources.md).
+To build a VM machine from this repo's source, see the [Azure instructions](docs/create-image-and-azure-resources.md) or the [Proxmox instructions](docs/create-image-and-proxmox-resources.md) (Ubuntu 26.04 x86_64 templates, including [fleet rollout](docs/create-image-and-proxmox-resources.md#deploy-a-runner-fleet)).
 
 ## Available Images
 
