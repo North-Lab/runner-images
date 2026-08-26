@@ -17,6 +17,380 @@ source "$ENV_FILE"
 : "${RUNNER_TARBALL_URL:?}"
 
 umask 077
+
+write_bundled_disk_cleanup() {
+    # Fallback when fleet deploy did not upload tools/proxmox-runners/disk-cleanup.
+    # Bodies must stay identical to that directory (enforced by unit tests).
+    mkdir -p "$1"
+    cat >"$1/actions-runner-disk-cleanup" <<'ACTIONS_RUNNER_DISK_CLEANUP_SCRIPT'
+#!/bin/bash
+# Idle disk cleanup for self-hosted GitHub Actions runners.
+# Never interrupt a running job (Runner.Worker). Always uncordon the runner
+# service, even when a cleanup step fails.
+set -euo pipefail
+
+THRESHOLD="${DISK_CLEANUP_THRESHOLD:-70}"
+RUNNER_DIR="${RUNNER_DIR:-/opt/actions-runner}"
+RUNNER_USER="${RUNNER_USER:-runner}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/var/lib/docker}"
+LOCK_FILE="${LOCK_FILE:-/run/actions-runner-disk-cleanup.lock}"
+IF_PRESSURE=0
+
+log() {
+    echo "actions-runner-disk-cleanup: $*"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: actions-runner-disk-cleanup [--if-pressure]
+
+  (default)       Clean when the runner is idle (6h timer).
+  --if-pressure   Clean only when idle AND disk use is >= 70% on the
+                  filesystems that hold the runner directory or Docker data.
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --if-pressure) IF_PRESSURE=1 ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --threshold=*)
+            THRESHOLD="${arg#--threshold=}"
+            ;;
+        *)
+            log "unknown argument: $arg" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+job_running() {
+    # Runner.Worker is the Actions job process. Runner.Listener stays up while
+    # idle and must not be treated as a running job.
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -x Runner.Worker >/dev/null 2>&1; then
+            return 0
+        fi
+        if pgrep -f '[R]unner.Worker' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+usage_pct_for_path() {
+    local path="$1"
+    while [ -n "$path" ] && [ "$path" != "/" ] && [ ! -e "$path" ]; do
+        path=$(dirname "$path")
+    done
+    [ -e "$path" ] || path=/
+    df -P "$path" 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); if ($5 ~ /^[0-9]+$/) print $5 }'
+}
+
+docker_data_paths() {
+    local root=""
+    if command -v docker >/dev/null 2>&1; then
+        root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+    fi
+    if [ -n "$root" ]; then
+        printf '%s\n' "$root"
+    elif [ -e "$DOCKER_DATA_ROOT" ]; then
+        printf '%s\n' "$DOCKER_DATA_ROOT"
+    fi
+}
+
+disk_over_threshold() {
+    local path pct
+    local -a paths=("$RUNNER_DIR")
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        paths+=("$path")
+    done < <(docker_data_paths)
+
+    for path in "${paths[@]}"; do
+        pct=$(usage_pct_for_path "$path" || true)
+        [ -n "${pct:-}" ] || continue
+        if [ "$pct" -ge "$THRESHOLD" ]; then
+            log "filesystem for ${path} is ${pct}% full (>= ${THRESHOLD}%)"
+            return 0
+        fi
+        log "filesystem for ${path} is ${pct}% full (below ${THRESHOLD}%)"
+    done
+    return 1
+}
+
+list_runner_units() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl list-units --type=service --all --no-legend --no-pager --plain 'actions.runner.*' 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -E '^actions\.runner\..+\.service$' || true
+}
+
+CORDONED_UNITS=()
+uncordon() {
+    local unit
+    for unit in "${CORDONED_UNITS[@]+"${CORDONED_UNITS[@]}"}"; do
+        log "starting ${unit}"
+        systemctl start "$unit" || log "warning: failed to start ${unit}"
+    done
+}
+
+install -d -m 0755 "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "another cleanup is already running; skip"
+    exit 0
+fi
+
+if job_running; then
+    log "job running (Runner.Worker); skip"
+    exit 0
+fi
+
+if [ "$IF_PRESSURE" -eq 1 ]; then
+    if ! disk_over_threshold; then
+        log "disk below ${THRESHOLD}% on runner/Docker filesystems; skip"
+        exit 0
+    fi
+    if job_running; then
+        log "job running after disk check; skip"
+        exit 0
+    fi
+fi
+
+if job_running; then
+    log "job running on re-check; skip"
+    exit 0
+fi
+
+trap uncordon EXIT
+
+mapfile -t CORDONED_UNITS < <(list_runner_units)
+if [ "${#CORDONED_UNITS[@]}" -gt 0 ]; then
+    log "idle confirmed; cordoning ${CORDONED_UNITS[*]}"
+    if job_running; then
+        log "job running immediately before cordon; skip"
+        CORDONED_UNITS=()
+        exit 0
+    fi
+    local_unit=""
+    for local_unit in "${CORDONED_UNITS[@]}"; do
+        systemctl stop "$local_unit" || log "warning: failed to stop ${local_unit}"
+    done
+else
+    log "no actions.runner.*.service units loaded; continuing without cordon"
+fi
+
+if job_running; then
+    log "job still present after cordon; skip cleanup (will uncordon)"
+    exit 0
+fi
+
+cleanup_diag() {
+    local diag="${RUNNER_DIR}/_diag"
+    [ -d "$diag" ] || return 0
+    log "cleaning ${diag} logs"
+    find "$diag" -type f \( -name '*.log' -o -name '*.log.*' -o -name 'Worker_*' -o -name 'Runner_*' \) -delete || true
+    find "$diag" -type f -delete || true
+}
+
+cleanup_work() {
+    local work="${RUNNER_DIR}/_work"
+    [ -d "$work" ] || return 0
+    log "removing leftover safe job dirs under ${work}"
+    local entry name
+    # Reserved runner internals under _work. Job workspaces (_temp, repo dirs,
+    # _actions) are leftover once idle + cordoned.
+    for entry in "$work"/* "$work"/.[!.]* "$work"/..?*; do
+        [ -e "$entry" ] || continue
+        name=$(basename "$entry")
+        case "$name" in
+            _tool|_update) continue ;;
+        esac
+        rm -rf "$entry" || log "warning: failed to remove ${entry}"
+    done
+    mkdir -p "$work"
+}
+
+cleanup_docker() {
+    command -v docker >/dev/null 2>&1 || return 0
+    if ! docker info >/dev/null 2>&1; then
+        log "docker is installed but the daemon is not reachable; skip docker prune"
+        return 0
+    fi
+    log "pruning leftover docker containers, builder cache, and unused images"
+    docker container prune -f || log "warning: docker container prune failed"
+    docker builder prune -af || log "warning: docker builder prune failed"
+    docker image prune -af || log "warning: docker image prune failed"
+}
+
+chown_work() {
+    local work="${RUNNER_DIR}/_work"
+    mkdir -p "$work"
+    if id "$RUNNER_USER" >/dev/null 2>&1; then
+        log "chown -R ${RUNNER_USER}:${RUNNER_USER} ${work}"
+        chown -R "$RUNNER_USER:$RUNNER_USER" "$work" || log "warning: chown ${work} failed"
+    else
+        log "user ${RUNNER_USER} does not exist; skip chown"
+    fi
+}
+
+cleanup_diag || log "warning: _diag cleanup failed"
+cleanup_work || log "warning: _work cleanup failed"
+cleanup_docker || log "warning: docker cleanup failed"
+chown_work || log "warning: _work chown failed"
+
+log "cleanup finished; runner service will be started by EXIT trap"
+ACTIONS_RUNNER_DISK_CLEANUP_SCRIPT
+    chmod 0755 "$1/actions-runner-disk-cleanup"
+    cat >"$1/actions-runner-disk-cleanup.service" <<'ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_SERVICE'
+[Unit]
+Description=GitHub Actions runner idle disk cleanup
+Documentation=file:///opt/actions-runner
+After=local-fs.target
+# Do not Conflict= the runner service; this unit cordons it from ExecStart.
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/actions-runner-disk-cleanup
+ExecStart=/usr/local/sbin/actions-runner-disk-cleanup
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target
+ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_SERVICE
+    chmod 0644 "$1/actions-runner-disk-cleanup.service"
+    cat >"$1/actions-runner-disk-cleanup.timer" <<'ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_TIMER'
+[Unit]
+Description=Run idle runner disk cleanup every 6 hours
+Requires=actions-runner-disk-cleanup.service
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=10min
+AccuracySec=1min
+Unit=actions-runner-disk-cleanup.service
+
+[Install]
+WantedBy=timers.target
+ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_TIMER
+    chmod 0644 "$1/actions-runner-disk-cleanup.timer"
+    cat >"$1/actions-runner-disk-cleanup-pressure.service" <<'ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_PRESSURE_SERVICE'
+[Unit]
+Description=GitHub Actions runner idle disk cleanup (only if disk >= 70%)
+Documentation=file:///opt/actions-runner
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/actions-runner-disk-cleanup
+ExecStart=/usr/local/sbin/actions-runner-disk-cleanup --if-pressure
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target
+ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_PRESSURE_SERVICE
+    chmod 0644 "$1/actions-runner-disk-cleanup-pressure.service"
+    cat >"$1/actions-runner-disk-cleanup-pressure.timer" <<'ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_PRESSURE_TIMER'
+[Unit]
+Description=Check runner/Docker disk use every 15 minutes and clean if idle and >= 70%
+Requires=actions-runner-disk-cleanup-pressure.service
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=false
+RandomizedDelaySec=2min
+AccuracySec=1min
+Unit=actions-runner-disk-cleanup-pressure.service
+
+[Install]
+WantedBy=timers.target
+ACTIONS_RUNNER_DISK_CLEANUP_ACTIONS_RUNNER_DISK_CLEANUP_PRESSURE_TIMER
+    chmod 0644 "$1/actions-runner-disk-cleanup-pressure.timer"
+    cat >"$1/install.sh" <<'ACTIONS_RUNNER_DISK_CLEANUP_INSTALL_SH'
+#!/bin/bash
+# Install the idle disk-cleanup oneshot service and timers.
+# START_TIMERS=0  — enable timers only (Packer image build; do not fire now).
+# START_TIMERS=1  — enable and start timers (guest-setup on a live clone).
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+DESTDIR="${DESTDIR:-}"
+START_TIMERS="${START_TIMERS:-1}"
+RUNNER_USER="${RUNNER_USER:-runner}"
+RUNNER_DIR="${RUNNER_DIR:-/opt/actions-runner}"
+DISK_CLEANUP_THRESHOLD="${DISK_CLEANUP_THRESHOLD:-70}"
+
+install -d -m 0755 \
+    "${DESTDIR}/usr/local/sbin" \
+    "${DESTDIR}/etc/systemd/system" \
+    "${DESTDIR}/etc/default"
+install -m 0755 "$HERE/actions-runner-disk-cleanup" "${DESTDIR}/usr/local/sbin/actions-runner-disk-cleanup"
+install -m 0644 "$HERE/actions-runner-disk-cleanup.service" "${DESTDIR}/etc/systemd/system/actions-runner-disk-cleanup.service"
+install -m 0644 "$HERE/actions-runner-disk-cleanup.timer" "${DESTDIR}/etc/systemd/system/actions-runner-disk-cleanup.timer"
+install -m 0644 "$HERE/actions-runner-disk-cleanup-pressure.service" "${DESTDIR}/etc/systemd/system/actions-runner-disk-cleanup-pressure.service"
+install -m 0644 "$HERE/actions-runner-disk-cleanup-pressure.timer" "${DESTDIR}/etc/systemd/system/actions-runner-disk-cleanup-pressure.timer"
+
+cat >"${DESTDIR}/etc/default/actions-runner-disk-cleanup" <<EOF
+RUNNER_USER=${RUNNER_USER}
+RUNNER_DIR=${RUNNER_DIR}
+DISK_CLEANUP_THRESHOLD=${DISK_CLEANUP_THRESHOLD}
+EOF
+chmod 0644 "${DESTDIR}/etc/default/actions-runner-disk-cleanup"
+
+if [ -n "$DESTDIR" ]; then
+    echo "Installed disk-cleanup units under ${DESTDIR} (skipped systemctl)"
+    exit 0
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable actions-runner-disk-cleanup.timer
+    systemctl enable actions-runner-disk-cleanup-pressure.timer
+    if [ "$START_TIMERS" = 1 ]; then
+        systemctl start actions-runner-disk-cleanup.timer
+        systemctl start actions-runner-disk-cleanup-pressure.timer
+        echo "Enabled and started actions-runner-disk-cleanup timers"
+    else
+        echo "Enabled actions-runner-disk-cleanup timers (not started; START_TIMERS=0)"
+    fi
+else
+    echo "systemctl not available; files installed under /etc/systemd/system"
+fi
+ACTIONS_RUNNER_DISK_CLEANUP_INSTALL_SH
+    chmod 0755 "$1/install.sh"
+}
+
+install_runner_disk_cleanup() {
+    local src="${DISK_CLEANUP_SRC:-}"
+    local dir
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    for dir in ${src:+"$src"} /tmp/actions-runner-disk-cleanup "$script_dir/disk-cleanup"; do
+        [ -n "$dir" ] || continue
+        if [ -f "$dir/install.sh" ]; then
+            echo "Installing runner disk-cleanup timers from ${dir}"
+            START_TIMERS=1 RUNNER_USER="$RUNNER_USER" RUNNER_DIR="$RUNNER_DIR" bash "$dir/install.sh"
+            return
+        fi
+    done
+    echo "Bundling runner disk-cleanup assets (not uploaded next to guest-setup)"
+    dir=/tmp/actions-runner-disk-cleanup
+    write_bundled_disk_cleanup "$dir"
+    START_TIMERS=1 RUNNER_USER="$RUNNER_USER" RUNNER_DIR="$RUNNER_DIR" bash "$dir/install.sh"
+}
+
 cleanup() {
     rm -f "$ENV_FILE" /tmp/actions-runner.tgz
 }
@@ -147,6 +521,8 @@ if ! grep -qxF "$wanted" "$ENV_RUNNER"; then
 fi
 chown "$RUNNER_USER:$RUNNER_USER" "$ENV_RUNNER"
 chmod 0644 "$ENV_RUNNER"
+
+install_runner_disk_cleanup
 
 if [ ! -f "$RUNNER_DIR/.service" ]; then
     "$RUNNER_DIR/svc.sh" install "$RUNNER_USER"

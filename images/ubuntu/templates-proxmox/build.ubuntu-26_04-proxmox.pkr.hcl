@@ -228,6 +228,33 @@ build {
     scripts          = ["${path.root}/../scripts/build/post-build-validation.sh"]
   }
 
+  # Idle disk-cleanup timer for self-hosted clones. Enable only (do not start)
+  # so the image build does not prune Docker or fire the oneshot.
+  provisioner "shell" {
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
+    inline          = ["mkdir -p /tmp/actions-runner-disk-cleanup"]
+  }
+
+  provisioner "file" {
+    sources = [
+      "${path.root}/../../../tools/proxmox-runners/disk-cleanup/actions-runner-disk-cleanup",
+      "${path.root}/../../../tools/proxmox-runners/disk-cleanup/actions-runner-disk-cleanup.service",
+      "${path.root}/../../../tools/proxmox-runners/disk-cleanup/actions-runner-disk-cleanup.timer",
+      "${path.root}/../../../tools/proxmox-runners/disk-cleanup/actions-runner-disk-cleanup-pressure.service",
+      "${path.root}/../../../tools/proxmox-runners/disk-cleanup/actions-runner-disk-cleanup-pressure.timer",
+      "${path.root}/../../../tools/proxmox-runners/disk-cleanup/install.sh"
+    ]
+    destination = "/tmp/actions-runner-disk-cleanup/"
+  }
+
+  provisioner "shell" {
+    execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
+    inline = [
+      "START_TIMERS=0 RUNNER_USER=runner RUNNER_DIR=/opt/actions-runner bash /tmp/actions-runner-disk-cleanup/install.sh",
+      "rm -rf /tmp/actions-runner-disk-cleanup"
+    ]
+  }
+
   provisioner "shell" {
     execute_command = "sudo sh -c '{{ .Vars }} {{ .Path }}'"
     scripts         = ["${path.root}/scripts/deprovision-proxmox.sh"]

@@ -22,6 +22,7 @@ from typing import Any
 
 TOOL_DIR = Path(__file__).resolve().parent
 GUEST_SETUP = TOOL_DIR / "guest-setup.sh"
+DISK_CLEANUP_DIR = TOOL_DIR / "disk-cleanup"
 DEFAULT_LABELS = ["self-hosted", "linux", "x64", "ubuntu-26.04"]
 RUNNER_REPO = "actions/runner"
 AGENT_PING_HTTP_TIMEOUT = 8
@@ -908,6 +909,17 @@ class Fleet:
             {"file": path, "content": content},
         )
 
+    def write_disk_cleanup_assets(self, node: str, vmid: int) -> None:
+        if not DISK_CLEANUP_DIR.is_dir():
+            fatal(f"missing {DISK_CLEANUP_DIR}")
+        remote = "/tmp/actions-runner-disk-cleanup"
+        self.agent_exec(node, vmid, ["mkdir", "-p", remote], timeout=60)
+        for path in sorted(DISK_CLEANUP_DIR.iterdir()):
+            if not path.is_file():
+                continue
+            self.agent_write(node, vmid, f"{remote}/{path.name}", path.read_text(encoding="utf-8"))
+        log(f"wrote disk-cleanup assets to VM {vmid} {remote}")
+
     def setup_guest(self, node: str, vmid: int, name: str) -> None:
         if not GUEST_SETUP.is_file():
             fatal(f"missing {GUEST_SETUP}")
@@ -925,6 +937,7 @@ class Fleet:
         log(f"writing guest-setup files to VM {vmid} / {node} via qemu-guest-agent")
         self.agent_write(node, vmid, "/tmp/proxmox-runner-fleet.env", env_text)
         self.agent_write(node, vmid, "/tmp/proxmox-runner-fleet.sh", GUEST_SETUP.read_text(encoding="utf-8"))
+        self.write_disk_cleanup_assets(node, vmid)
         log(
             f"running guest-setup on {name} (cloud-init check, post-gen, runner download). "
             "This can take several minutes; guest stdout is printed when exec finishes."
@@ -942,7 +955,17 @@ class Fleet:
         if code != 0:
             fatal(f"guest setup failed on {name} (VM {vmid}, node {node}) with exit {code}")
         log(f"guest-setup finished on {name}; removing temp files")
-        self.agent_exec(node, vmid, ["rm", "-f", "/tmp/proxmox-runner-fleet.env", "/tmp/proxmox-runner-fleet.sh"])
+        self.agent_exec(
+            node,
+            vmid,
+            [
+                "rm",
+                "-rf",
+                "/tmp/proxmox-runner-fleet.env",
+                "/tmp/proxmox-runner-fleet.sh",
+                "/tmp/actions-runner-disk-cleanup",
+            ],
+        )
 
     def plan(self, count: int, nodes: list[str]) -> list[PlannedVM]:
         assignment = assign_nodes(nodes, count)

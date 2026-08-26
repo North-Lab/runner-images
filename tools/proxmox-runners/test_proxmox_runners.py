@@ -29,6 +29,7 @@ is_vmid_conflict = pr.is_vmid_conflict
 form_encode = pr.form_encode
 proxmox_not_implemented = pr.proxmox_not_implemented
 ping_succeeded = pr.ping_succeeded
+DISK_CLEANUP_DIR = pr.DISK_CLEANUP_DIR
 
 
 class ParseGitHubTargetTests(unittest.TestCase):
@@ -125,6 +126,16 @@ class MiscTests(unittest.TestCase):
         self.assertFalse(ping_succeeded(None))
         self.assertFalse(ping_succeeded(get_body))
         self.assertTrue(ping_succeeded({"result": {}}))
+
+
+class DiskCleanupAssetTests(unittest.TestCase):
+    def test_disk_cleanup_dir_is_shipped(self):
+        self.assertTrue(DISK_CLEANUP_DIR.is_dir())
+        self.assertTrue((DISK_CLEANUP_DIR / "install.sh").is_file())
+        self.assertTrue((DISK_CLEANUP_DIR / "actions-runner-disk-cleanup.timer").is_file())
+        source = Path(__file__).with_name("proxmox-runners.py").read_text(encoding="utf-8")
+        self.assertIn("write_disk_cleanup_assets", source)
+        self.assertIn("/tmp/actions-runner-disk-cleanup", source)
 
 
 if __name__ == "__main__":
