@@ -7,4 +7,8 @@ See [Deploy a runner fleet](../../docs/create-image-and-proxmox-resources.md#dep
 ```bash
 cp fleet.example.toml fleet.toml   # gitignored; do not commit tokens
 python3 proxmox-runners.py deploy --config fleet.toml --count 6
+# After rebuilding the Packer template, refresh per-node replicas:
+python3 proxmox-runners.py deploy --config fleet.toml --count 6 --recreate-templates
 ```
+
+`--recreate-templates` (or `[proxmox].recreate_templates = true`) deletes `ubuntu-2604-runner-<node>` replica templates and copies the current source template to each node again. Default is off (reuse replicas). It does not delete the source Packer template or runner VMs.

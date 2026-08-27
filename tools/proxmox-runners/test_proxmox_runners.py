@@ -22,6 +22,7 @@ render_ipconfig = pr.render_ipconfig
 resolve_count = pr.resolve_count
 runner_name = pr.runner_name
 replica_template_name = pr.replica_template_name
+replica_delete_refusal = pr.replica_delete_refusal
 trim_error = pr.trim_error
 http_status = pr.http_status
 is_agent_forbidden = pr.is_agent_forbidden
@@ -203,6 +204,11 @@ class FakePVE:
             return None
         if method == "POST" and path.endswith("/agent/ping"):
             return {"result": {}}
+        if method == "DELETE" and "/qemu/" in path:
+            vmid = int(path.split("/")[3])
+            with self._lock:
+                self.vms = [row for row in self.vms if int(row["vmid"]) != vmid]
+            return None
         return None
 
     def post_task(self, path, params, timeout):
@@ -277,6 +283,7 @@ def make_settings(**overrides):
         template_name="ubuntu-2604-runner",
         template_vmid=None,
         storage="local-lvm",
+        recreate_templates=False,
         task_timeout=30,
         name_prefix="gh-runner",
         vmid_start=701,
@@ -577,8 +584,151 @@ class ParallelLocalCloneTests(unittest.TestCase):
         self.assertIn("Phase A — template placement", text)
         self.assertIn("Phase B — parallel clones", text)
         self.assertIn("does **not** clone a runner on the template node and migrate that runner", text)
+        self.assertIn("--recreate-templates", text)
         readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
         self.assertIn("full-clones runner VMs from that node's replica in parallel", readme)
+        self.assertIn("--recreate-templates", readme)
+
+
+class RecreateTemplatesTests(unittest.TestCase):
+    def test_refusal_rules(self):
+        source = packer_template("pve1", 9000)
+        self.assertIn(
+            "source Packer template",
+            replica_delete_refusal(
+                source, "pve1", template_name="ubuntu-2604-runner", name_prefix="gh-runner"
+            ),
+        )
+        self.assertIn(
+            "looks like a runner",
+            replica_delete_refusal(
+                {"vmid": 701, "name": "gh-runner-01", "template": 1, "node": "pve2"},
+                "pve2",
+                template_name="ubuntu-2604-runner",
+                name_prefix="gh-runner",
+            ),
+        )
+        leftover = replica_on("pve2", 9001)
+        leftover["template"] = 0
+        self.assertIn(
+            "not a template",
+            replica_delete_refusal(
+                leftover, "pve2", template_name="ubuntu-2604-runner", name_prefix="gh-runner"
+            ),
+        )
+        self.assertIsNone(
+            replica_delete_refusal(
+                replica_on("pve2", 9001),
+                "pve2",
+                template_name="ubuntu-2604-runner",
+                name_prefix="gh-runner",
+                source=source,
+            )
+        )
+        same_as_source = dict(source)
+        same_as_source["name"] = "ubuntu-2604-runner-pve1"
+        self.assertIn(
+            "source Packer template",
+            replica_delete_refusal(
+                same_as_source,
+                "pve1",
+                template_name="ubuntu-2604-runner",
+                name_prefix="gh-runner",
+                source=source,
+            ),
+        )
+
+    def test_recreate_deletes_replicas_not_source_or_runners(self):
+        runner = {
+            "vmid": 701,
+            "name": "gh-runner-01",
+            "node": "pve1",
+            "template": 0,
+            "type": "vm",
+            "status": "running",
+        }
+        pve = FakePVE(
+            vms=[
+                packer_template("pve1", 9000),
+                replica_on("pve2", 9001),
+                replica_on("pve3", 9002),
+                runner,
+            ]
+        )
+        fleet = make_fleet(pve, recreate_templates=True)
+        fleet.setup_guest = lambda node, vmid, name: None
+        fleet.deploy(1)
+
+        deletes = [path for method, path, _params in pve.calls if method == "DELETE"]
+        self.assertEqual(
+            set(deletes),
+            {"nodes/pve2/qemu/9001", "nodes/pve3/qemu/9002"},
+        )
+        self.assertTrue(any(int(row["vmid"]) == 9000 for row in pve.vms))
+        self.assertTrue(any(row.get("name") == "gh-runner-01" for row in pve.vms))
+        replica_clones = [
+            op for op in task_ops(pve) if op[0] == "clone" and op[2]["name"].startswith("ubuntu-2604-runner-")
+        ]
+        self.assertEqual(
+            {op[2]["name"] for op in replica_clones},
+            {"ubuntu-2604-runner-pve2", "ubuntu-2604-runner-pve3"},
+        )
+        runner_clones = [
+            op for op in task_ops(pve) if op[0] == "clone" and op[2]["name"].startswith("gh-runner-")
+        ]
+        self.assertEqual(runner_clones, [])
+        names = {row.get("name") for row in pve.vms}
+        self.assertIn("ubuntu-2604-runner", names)
+        self.assertIn("ubuntu-2604-runner-pve2", names)
+        self.assertIn("ubuntu-2604-runner-pve3", names)
+        self.assertNotIn(9001, {int(row["vmid"]) for row in pve.vms})
+        self.assertNotIn(9002, {int(row["vmid"]) for row in pve.vms})
+
+    def test_default_off_reuses_replicas(self):
+        pve = FakePVE(vms=[packer_template("pve1", 9000), replica_on("pve2", 9001)])
+        fleet = make_fleet(pve)
+        self.assertFalse(fleet.settings.recreate_templates)
+        placed = fleet.place_templates(["pve1", "pve2"], "local-lvm")
+        self.assertEqual(placed["pve2"]["vmid"], 9001)
+        self.assertEqual([path for method, path, _ in pve.calls if method == "DELETE"], [])
+
+    def test_refuses_leftover_non_template(self):
+        leftover = replica_on("pve2", 9001)
+        leftover["template"] = 0
+        pve = FakePVE(vms=[packer_template("pve1", 9000), leftover])
+        fleet = make_fleet(pve, recreate_templates=True)
+        with self.assertRaises(SystemExit):
+            fleet.place_templates(["pve1", "pve2"], "local-lvm")
+        self.assertTrue(any(int(row["vmid"]) == 9001 for row in pve.vms))
+        self.assertTrue(any(int(row["vmid"]) == 9000 for row in pve.vms))
+
+    def test_shared_storage_ignores_recreate(self):
+        pve = FakePVE(shared=True, vms=[packer_template("pve1", 9000), replica_on("pve2", 9001)])
+        fleet = make_fleet(pve, recreate_templates=True)
+        placed = fleet.place_templates(["pve1", "pve2", "pve3"], "local-lvm")
+        self.assertEqual({placed[n]["vmid"] for n in placed}, {9000})
+        self.assertEqual([path for method, path, _ in pve.calls if method == "DELETE"], [])
+
+    def test_cli_and_toml_enable_flag(self):
+        parser = pr.build_parser()
+        common = [
+            "deploy",
+            "--count",
+            "1",
+            "--proxmox-url",
+            "https://pve.example:8006",
+            "--proxmox-username",
+            "u@pve!t",
+        ]
+        on = parser.parse_args([*common, "--recreate-templates"])
+        self.assertTrue(on.recreate_templates)
+        self.assertTrue(pr.Settings.from_sources({}, on).recreate_templates)
+        off = parser.parse_args(common)
+        self.assertFalse(off.recreate_templates)
+        self.assertFalse(pr.Settings.from_sources({}, off).recreate_templates)
+        self.assertTrue(
+            pr.Settings.from_sources({"proxmox": {"recreate_templates": True}}, off).recreate_templates
+        )
 
 
 if __name__ == "__main__":

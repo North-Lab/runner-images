@@ -19,6 +19,8 @@ template_name = "ubuntu-2604-runner"
 # local-lvm / ZFS is node-local: Phase A copies the template to each node once
 # (reuse ubuntu-2604-runner-<node>), Phase B full-clones runners locally in
 # parallel. Shared storage (nfs, ceph, cifs) clones directly with target=.
+# recreate_templates = false  # or deploy --recreate-templates: delete
+# ubuntu-2604-runner-<node> replicas and copy the source template again.
 storage = "local-lvm"
 task_timeout_seconds = 7200
 

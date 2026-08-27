@@ -125,6 +125,34 @@ def replica_template_name(template_name: str, node: str) -> str:
     return f"{template_name}-{node}"
 
 
+def replica_delete_refusal(
+    row: dict[str, Any],
+    node: str,
+    *,
+    template_name: str,
+    name_prefix: str,
+    source: dict[str, Any] | None = None,
+) -> str | None:
+    """Why this VM must not be deleted as a per-node replica, or None if it is safe."""
+    name = row.get("name") or ""
+    vmid = row.get("vmid")
+    wanted = replica_template_name(template_name, node)
+    if name == template_name:
+        return (
+            f"refusing to delete {name!r} (VMID {vmid}): that is the source Packer template "
+            f"(name has no -{node} suffix)"
+        )
+    if name_prefix and (name == name_prefix or name.startswith(name_prefix + "-")):
+        return f"refusing to delete {name!r} (VMID {vmid}): name looks like a runner ({name_prefix}-*)"
+    if not row.get("template"):
+        return f"refusing to delete {name!r} (VMID {vmid}): not a template"
+    if name != wanted:
+        return f"refusing to delete {name!r} (VMID {vmid}): expected replica name {wanted!r}"
+    if source is not None and vmid is not None and int(vmid) == int(source.get("vmid") or 0):
+        return f"refusing to delete the source Packer template (VMID {vmid}) on {source.get('node')}"
+    return None
+
+
 def render_ipconfig(template: str, index: int, ip_start: int) -> str:
     if "{n}" not in template:
         return template
@@ -429,6 +457,7 @@ class Settings:
     template_name: str
     template_vmid: int | None
     storage: str
+    recreate_templates: bool
     task_timeout: int
     name_prefix: str
     vmid_start: int | None
@@ -514,6 +543,10 @@ class Settings:
             or cfg_get(config, "proxmox", "template_name", "ubuntu-2604-runner"),
             template_vmid=template_vmid,
             storage=getattr(args, "storage", "") or cfg_get(config, "proxmox", "storage", "local-lvm"),
+            recreate_templates=bool(
+                getattr(args, "recreate_templates", False)
+                or cfg_get(config, "proxmox", "recreate_templates", False)
+            ),
             task_timeout=int(cfg_get(config, "proxmox", "task_timeout_seconds", 7200) or 7200),
             name_prefix=getattr(args, "name_prefix", "") or cfg_get(config, "vm", "name_prefix", "gh-runner"),
             vmid_start=vmid_start,
@@ -839,15 +872,52 @@ class Fleet:
         log(f"created template replica {replica_vmid} ({replica_name}) on {node}")
         return {"node": node, "vmid": replica_vmid, "name": replica_name, "template": 1}
 
+    def delete_replica_template(self, row: dict[str, Any], node: str, source: dict[str, Any]) -> None:
+        reason = replica_delete_refusal(
+            row,
+            node,
+            template_name=self.settings.template_name,
+            name_prefix=self.settings.name_prefix,
+            source=source,
+        )
+        if reason:
+            fatal(reason)
+        vmid = int(row["vmid"])
+        log(f"Phase A: deleting replica template {row.get('name')} (VMID {vmid}) on {node}")
+        self.pve.call(
+            "DELETE",
+            f"nodes/{node}/qemu/{vmid}",
+            {"purge": 1, "destroy-unreferenced-disks": 1},
+        )
+        self._used_vmids.discard(vmid)
+
+    def remove_node_replicas(self, nodes: list[str], source: dict[str, Any]) -> None:
+        """Delete {template}-{node} replicas so Phase A can copy the current source again."""
+        for node in nodes:
+            replica = self.find_replica_vm(node)
+            if replica is None:
+                continue
+            self.delete_replica_template(replica, node, source)
+
     def place_templates(self, nodes: list[str], storage: str) -> dict[str, dict[str, Any]]:
         """Phase A: a template replica on every local-storage node. Shared storage: no replica."""
         source = self.find_template()
         if self.storage_is_shared(storage):
+            if self.settings.recreate_templates:
+                log("Phase A: --recreate-templates is ignored on shared storage (no per-node replica)")
             log(
                 f"Phase A: template {source['vmid']} is on shared storage {storage}; "
                 "no per-node replica"
             )
             return {node: source for node in nodes}
+
+        if self.settings.recreate_templates:
+            log(
+                "Phase A: --recreate-templates: replacing "
+                f"{self.settings.template_name}-<node> replicas from source "
+                f"{source['vmid']} on {source['node']}"
+            )
+            self.remove_node_replicas(nodes, source)
 
         placed: dict[str, dict[str, Any]] = {}
         missing: list[str] = []
@@ -1320,6 +1390,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(deploy)
     deploy.add_argument("--count", type=int, help="total runner VMs (placed round-robin)")
     deploy.add_argument("--per-node", type=int, help="runners per online target node")
+    deploy.add_argument(
+        "--recreate-templates",
+        action="store_true",
+        help=(
+            "delete per-node {template}-{node} replica templates and copy the "
+            "source Packer template to each node again (default: reuse replicas)"
+        ),
+    )
 
     destroy = sub.add_parser("destroy", help="stop and delete fleet VMs")
     add_common_args(destroy)
