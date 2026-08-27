@@ -225,12 +225,12 @@ cp tools/proxmox-runners/fleet.example.toml tools/proxmox-runners/fleet.toml
 
 ### Storage assumption
 
-Proxmox **cannot** clone a template whose disks live on non-shared storage (`local-lvm`, local `dir`) directly onto another node (`qm clone --target` requires shared storage).
+Proxmox **cannot** clone a template whose disks live on non-shared storage (`local-lvm`, local `dir`) directly onto another node (`qm clone --target` requires shared storage). The fleet tool therefore **copies the template once per node**, then clones runners locally. It does **not** clone a runner on the template node and migrate that runner.
 
 | Template disk storage | What the tool does |
 | --------------------- | ------------------ |
-| Shared (`nfs`, `ceph`/`rbd`, `cifs`, … `shared=1`) | Full clone with `target=<node>`. |
-| Node-local (`local-lvm`, typical home lab) | Full clone on the template node, then **offline migrate** with `with-local-disks=1` to create a template replica on each target node. Runner VMs are then cloned locally on that node. |
+| Shared (`nfs`, `ceph`/`rbd`, `cifs`, … `shared=1`) | No replica. Full clone with `target=<node>` (same as today). |
+| Node-local (`local-lvm`, ZFS, typical home lab) | **Phase A — template placement:** if `ubuntu-2604-runner-<node>` (or another matching template) is already on that node, reuse it. Otherwise clone the Packer template on the source node, **offline migrate** that replica with `with-local-disks=1`, and convert it to a template. Replica copies for missing nodes run in parallel. **Phase B — parallel clones:** full-clone every new runner VM from the **local** replica on its assigned node (all clones at once). **Phase C — boot/register:** start + wait for qemu-guest-agent (parallel), then guest-setup (sequential). |
 
 Each target node must already have a storage with the **same id** as `[proxmox].storage` (default `local-lvm`) and `content` including `images`. If a node cannot receive that disk, the tool exits with the storages that node does have. It does not invent a storage or silently place every VM on the template node.
 
@@ -247,6 +247,8 @@ python3 tools/proxmox-runners/proxmox-runners.py nodes --config tools/proxmox-ru
 
 `--count 6` on three online nodes places two VMs per node (round-robin: `gh-runner-01` … `gh-runner-06`). `--per-node 2` is the same if three nodes are online.
 
+On a 3-node `local-lvm` / ZFS cluster this is **copy the template once, then clone locally in parallel** — not six sequential clone+boot+register loops, and not a network migrate per runner.
+
 ```bash
 export PROXMOX_URL PROXMOX_USERNAME PROXMOX_TOKEN
 export GITHUB_TOKEN
@@ -256,17 +258,21 @@ python3 tools/proxmox-runners/proxmox-runners.py deploy \
   --count 6
 ```
 
-For each VM the tool:
+Deploy is three phases:
 
-1. Allocates a unique VMID (`cluster/nextid`, or `[vm].vmid_start`).
-2. Full-clones the template (or the per-node replica).
-3. Applies Cloud-Init (`ciuser`, optional SSH key, `ip=dhcp` or `ip=192.168.1.{n}/24,gw=...`).
-4. Starts the VM and waits for qemu-guest-agent.
-5. Runs `/opt/post-generation` as root (once per VM; stamped with `.fleet-done`).
-6. Downloads `actions/runner` **linux-x64** (latest release unless `runner_version` is pinned).
-7. Registers with a **fresh** registration token (`POST .../actions/runners/registration-token`) for the repo or org in `[github].url`.
-8. Adds `ciuser` (default `runner`) to the `docker` group if Docker is installed, then installs the systemd service with `svc.sh install` / `svc.sh start`.
-9. Installs the idle disk-cleanup oneshot + timers (`actions-runner-disk-cleanup.timer` every 6 hours, `actions-runner-disk-cleanup-pressure.timer` every 15 minutes when disk is at least 70%). Already-deployed VMs pick this up on the next `deploy` / guest-setup. The job-started `_work` chown hook is unchanged.
+1. **Template placement** — ensure a template replica exists on every target node. Reuses `ubuntu-2604-runner-<node>` when present. Shared storage skips this.
+2. **Parallel clones** — full-clone all *new* runner VMs at once, each from the replica already on that node. Existing VMs are reused by name and are not recloned. VMID allocation is locked so two threads never take the same `nextid`. A `File exists` / `already exists` conflict retries with a new id.
+3. **Boot / register** — Cloud-Init, start, and qemu-guest-agent wait run in parallel. guest-setup (post-gen, runner download, GitHub registration) stays sequential so it does not block cloning.
+
+After clones exist, boot + guest-setup on each VM still:
+
+1. Applies Cloud-Init (`ciuser`, optional SSH key, `ip=dhcp` or `ip=192.168.1.{n}/24,gw=...`).
+2. Starts the VM and waits for qemu-guest-agent (`POST` `agent/ping`).
+3. Runs `/opt/post-generation` as root (once per VM; stamped with `.fleet-done`).
+4. Downloads `actions/runner` **linux-x64** (latest release unless `runner_version` is pinned).
+5. Registers with a **fresh** registration token (`POST .../actions/runners/registration-token`) for the repo or org in `[github].url`.
+6. Adds `ciuser` (default `runner`) to the `docker` group if Docker is installed, then installs the systemd service with `svc.sh install` / `svc.sh start`.
+7. Installs the idle disk-cleanup oneshot + timers (`actions-runner-disk-cleanup.timer` every 6 hours, `actions-runner-disk-cleanup-pressure.timer` every 15 minutes when disk is at least 70%). Already-deployed VMs pick this up on the next `deploy` / guest-setup. The job-started `_work` chown hook is unchanged.
 
 Proxmox Cloud-Init (`ciuser`) cannot set supplementary groups. guest-setup is the reliable path so Actions jobs can use `unix:///var/run/docker.sock`.
 

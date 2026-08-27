@@ -16,8 +16,9 @@ insecure_skip_tls_verify = true
 template_name = "ubuntu-2604-runner"
 # template_vmid = 9000
 # Disk storage for full clones. Must exist on each target node with images content.
-# local-lvm is node-local: the tool clones on the template node then migrates
-# with-local-disks. Shared storage (nfs, ceph, cifs) clones directly to the target.
+# local-lvm / ZFS is node-local: Phase A copies the template to each node once
+# (reuse ubuntu-2604-runner-<node>), Phase B full-clones runners locally in
+# parallel. Shared storage (nfs, ceph, cifs) clones directly with target=.
 storage = "local-lvm"
 task_timeout_seconds = 7200
 
