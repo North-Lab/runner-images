@@ -11,4 +11,4 @@ python3 proxmox-runners.py deploy --config fleet.toml --count 6
 python3 proxmox-runners.py deploy --config fleet.toml --count 6 --recreate-templates
 ```
 
-`--recreate-templates` (or `[proxmox].recreate_templates = true`) deletes `ubuntu-2604-runner-<node>` replica templates and copies the current source template to each node again. Default is off (reuse replicas). It does not delete the source Packer template or runner VMs.
+`--recreate-templates` (or `[proxmox].recreate_templates = true`) deletes `ubuntu-2604-runner-<node>` replica templates, waits for each Proxmox delete task (UPID) to finish and confirms the replica is gone, then copies the current source template to each node again. Default is off (reuse replicas). It does not delete the source Packer template or runner VMs.

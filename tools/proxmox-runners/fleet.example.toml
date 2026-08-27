@@ -20,7 +20,8 @@ template_name = "ubuntu-2604-runner"
 # (reuse ubuntu-2604-runner-<node>), Phase B full-clones runners locally in
 # parallel. Shared storage (nfs, ceph, cifs) clones directly with target=.
 # recreate_templates = false  # or deploy --recreate-templates: delete
-# ubuntu-2604-runner-<node> replicas and copy the source template again.
+# ubuntu-2604-runner-<node> replicas (wait for each delete UPID), then copy
+# the source template again. The source Packer template is never deleted.
 storage = "local-lvm"
 task_timeout_seconds = 7200
 

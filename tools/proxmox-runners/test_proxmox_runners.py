@@ -23,6 +23,7 @@ resolve_count = pr.resolve_count
 runner_name = pr.runner_name
 replica_template_name = pr.replica_template_name
 replica_delete_refusal = pr.replica_delete_refusal
+is_absent_vm_error = pr.is_absent_vm_error
 trim_error = pr.trim_error
 http_status = pr.http_status
 is_agent_forbidden = pr.is_agent_forbidden
@@ -155,7 +156,17 @@ class FakeGitHub:
 
 
 class FakePVE:
-    def __init__(self, *, shared=False, nodes=None, vms=None, next_id=8000, clone_sleep=0.0):
+    def __init__(
+        self,
+        *,
+        shared=False,
+        nodes=None,
+        vms=None,
+        next_id=8000,
+        clone_sleep=0.0,
+        stale_delete=False,
+        fail_delete=None,
+    ):
         self.shared = shared
         self.nodes = list(nodes or ["pve1", "pve2", "pve3"])
         self.vms = [dict(row) for row in (vms or [])]
@@ -163,9 +174,21 @@ class FakePVE:
         self.tasks = []
         self.calls = []
         self.clone_sleep = clone_sleep
+        self.stale_delete = stale_delete
+        self.fail_delete = fail_delete
+        self.pending_deletes = {}
+        self.deleted_vmids = set()
+        self.waited_upids = []
         self.in_flight_runner_clones = 0
         self.max_in_flight_runner_clones = 0
         self._lock = threading.Lock()
+
+    def _missing_vm_error(self, method, path, vmid):
+        return ProxmoxAPIError(
+            f"{method} {path} failed: HTTP 500: Configuration file "
+            f"'nodes/pve/qemu-server/{vmid}.conf' does not exist",
+            status=500,
+        )
 
     def call(self, method, path, params=None, timeout=120):
         self.calls.append((method, path, params))
@@ -196,19 +219,33 @@ class FakePVE:
             return [{"storage": "local-lvm", "active": 1, "content": "images,iso"}]
         if method == "GET" and "/status/current" in path:
             vmid = int(path.split("/")[3])
+            if vmid in self.deleted_vmids:
+                raise self._missing_vm_error(method, path, vmid)
             for row in self.vms:
                 if int(row["vmid"]) == vmid:
                     return {"status": row.get("status") or "stopped"}
-            return {"status": "stopped"}
+            raise self._missing_vm_error(method, path, vmid)
         if method == "PUT" and path.endswith("/config"):
             return None
         if method == "POST" and path.endswith("/agent/ping"):
             return {"result": {}}
         if method == "DELETE" and "/qemu/" in path:
             vmid = int(path.split("/")[3])
+            node = path.split("/")[1]
+            if self.fail_delete is not None and (self.fail_delete is True or vmid in self.fail_delete):
+                raise ProxmoxAPIError(
+                    f"DELETE {path} failed: HTTP 500: VM {vmid} is locked",
+                    status=500,
+                )
+            if self.stale_delete:
+                upid = f"UPID:{node}:qmdestroy:{vmid}:stale"
+                with self._lock:
+                    self.pending_deletes[upid] = vmid
+                return upid
             with self._lock:
                 self.vms = [row for row in self.vms if int(row["vmid"]) != vmid]
-            return None
+                self.deleted_vmids.add(vmid)
+            return f"UPID:{node}:qmdestroy:{vmid}"
         return None
 
     def post_task(self, path, params, timeout):
@@ -268,7 +305,21 @@ class FakePVE:
             return f"UPID:{parts[1]}:start:{vmid}"
         return "UPID:fake:ok"
 
+    def delete_task(self, path, params, timeout):
+        rec = {"path": path, "params": dict(params or {}), "method": "DELETE"}
+        with self._lock:
+            self.tasks.append(rec)
+        upid = self.call("DELETE", path, params, timeout=timeout)
+        if isinstance(upid, str):
+            self.wait_task(upid, timeout)
+        return upid
+
     def wait_task(self, upid, timeout):
+        self.waited_upids.append(upid)
+        vmid = self.pending_deletes.pop(upid, None)
+        if vmid is not None:
+            with self._lock:
+                self.deleted_vmids.add(vmid)
         return None
 
 
@@ -585,9 +636,11 @@ class ParallelLocalCloneTests(unittest.TestCase):
         self.assertIn("Phase B — parallel clones", text)
         self.assertIn("does **not** clone a runner on the template node and migrate that runner", text)
         self.assertIn("--recreate-templates", text)
+        self.assertIn("waits for each Proxmox delete UPID", text)
         readme = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
         self.assertIn("full-clones runner VMs from that node's replica in parallel", readme)
         self.assertIn("--recreate-templates", readme)
+        self.assertIn("waits for each Proxmox delete task", readme)
 
 
 class RecreateTemplatesTests(unittest.TestCase):
@@ -708,6 +761,103 @@ class RecreateTemplatesTests(unittest.TestCase):
         placed = fleet.place_templates(["pve1", "pve2", "pve3"], "local-lvm")
         self.assertEqual({placed[n]["vmid"] for n in placed}, {9000})
         self.assertEqual([path for method, path, _ in pve.calls if method == "DELETE"], [])
+
+    def test_recreate_does_not_reuse_stale_deleted_replicas(self):
+        """Joe's bug: DELETE returns before UPID; cluster/resources still lists 104/105."""
+        pve = FakePVE(
+            vms=[
+                packer_template("pve1", 103),
+                replica_on("pve2", 104),
+                replica_on("pve3", 105),
+            ],
+            stale_delete=True,
+            next_id=200,
+        )
+        fleet = make_fleet(pve, recreate_templates=True)
+        placed = fleet.place_templates(["pve1", "pve2", "pve3"], "local-lvm")
+
+        self.assertEqual(placed["pve1"]["vmid"], 103)
+        self.assertEqual(placed["pve1"]["name"], "ubuntu-2604-runner")
+        self.assertNotEqual(placed["pve2"]["vmid"], 104)
+        self.assertNotEqual(placed["pve3"]["vmid"], 105)
+        self.assertEqual(placed["pve2"]["name"], "ubuntu-2604-runner-pve2")
+        self.assertEqual(placed["pve3"]["name"], "ubuntu-2604-runner-pve3")
+        self.assertEqual(placed["pve2"]["node"], "pve2")
+        self.assertEqual(placed["pve3"]["node"], "pve3")
+
+        deletes = [path for method, path, _ in pve.calls if method == "DELETE"]
+        self.assertEqual(set(deletes), {"nodes/pve2/qemu/104", "nodes/pve3/qemu/105"})
+        self.assertTrue(any(int(row["vmid"]) == 103 for row in pve.vms))
+        self.assertNotIn("nodes/pve1/qemu/103", deletes)
+        self.assertTrue(any(str(upid).startswith("UPID:pve2:qmdestroy:104") for upid in pve.waited_upids))
+        self.assertTrue(any(str(upid).startswith("UPID:pve3:qmdestroy:105") for upid in pve.waited_upids))
+
+        replica_clones = [
+            op for op in task_ops(pve) if op[0] == "clone" and op[2]["name"].startswith("ubuntu-2604-runner-")
+        ]
+        self.assertEqual(
+            {op[2]["name"] for op in replica_clones},
+            {"ubuntu-2604-runner-pve2", "ubuntu-2604-runner-pve3"},
+        )
+        self.assertEqual({int(op[2]["newid"]) for op in replica_clones} & {103, 104, 105}, set())
+        self.assertIn("pve2", fleet._skip_reuse_nodes)
+        self.assertIn("pve3", fleet._skip_reuse_nodes)
+        self.assertNotIn("pve1", fleet._skip_reuse_nodes)
+        self.assertEqual(fleet._skip_reuse_vmids, {104, 105})
+
+    def test_recreate_phase_b_clones_from_new_replicas_not_deleted_vmids(self):
+        pve = FakePVE(
+            vms=[
+                packer_template("pve1", 103),
+                replica_on("pve2", 104),
+                replica_on("pve3", 105),
+            ],
+            stale_delete=True,
+            next_id=200,
+        )
+        fleet = make_fleet(pve, recreate_templates=True)
+        fleet.setup_guest = lambda node, vmid, name: None
+        fleet.deploy(3)
+
+        runner_clones = [
+            op for op in task_ops(pve) if op[0] == "clone" and op[2]["name"].startswith("gh-runner-")
+        ]
+        self.assertEqual(len(runner_clones), 3)
+        by_name = {op[2]["name"]: op[1] for op in runner_clones}
+        self.assertTrue(by_name["gh-runner-01"].startswith("nodes/pve1/qemu/103/"))
+        pve2_src = int(by_name["gh-runner-02"].split("/")[3])
+        pve3_src = int(by_name["gh-runner-03"].split("/")[3])
+        self.assertNotIn(pve2_src, {103, 104, 105})
+        self.assertNotIn(pve3_src, {103, 104, 105})
+        self.assertTrue(by_name["gh-runner-02"].startswith(f"nodes/pve2/qemu/{pve2_src}/"))
+        self.assertTrue(by_name["gh-runner-03"].startswith(f"nodes/pve3/qemu/{pve3_src}/"))
+
+    def test_delete_failure_is_fatal_does_not_reuse(self):
+        pve = FakePVE(
+            vms=[packer_template("pve1", 103), replica_on("pve2", 104)],
+            fail_delete=True,
+        )
+        fleet = make_fleet(pve, recreate_templates=True)
+        with self.assertRaises(SystemExit):
+            fleet.place_templates(["pve1", "pve2"], "local-lvm")
+        self.assertTrue(any(int(row["vmid"]) == 103 for row in pve.vms))
+        self.assertTrue(any(int(row["vmid"]) == 104 for row in pve.vms))
+        self.assertEqual(
+            [op for op in task_ops(pve) if op[0] == "clone" and op[2]["name"].startswith("ubuntu-2604-runner-")],
+            [],
+        )
+
+    def test_absent_vm_error(self):
+        self.assertTrue(is_absent_vm_error(ProxmoxAPIError("GET ... HTTP 404: not found", status=404)))
+        self.assertTrue(
+            is_absent_vm_error(
+                ProxmoxAPIError(
+                    "GET ... HTTP 500: Configuration file 'nodes/pve2/qemu-server/104.conf' does not exist",
+                    status=500,
+                )
+            )
+        )
+        self.assertFalse(is_absent_vm_error(ProxmoxAPIError("DELETE ... HTTP 500: VM is locked", status=500)))
 
     def test_cli_and_toml_enable_flag(self):
         parser = pr.build_parser()
