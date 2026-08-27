@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Deploy GitHub Actions runner VMs across a Proxmox cluster.
 
-Clone the Ubuntu 26.04 Packer template, spread VMs across online nodes,
-run /opt/post-generation, and register actions/runner as a systemd service.
+Phase A copies the Ubuntu 26.04 Packer template to each local-storage node
+(once). Phase B full-clones runner VMs from that node's replica in parallel.
+Phase C starts guests and registers actions/runner. Runners are never cloned
+on the template node and migrated.
 """
 
 from __future__ import annotations
@@ -12,10 +14,12 @@ import json
 import os
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,10 +33,12 @@ AGENT_PING_HTTP_TIMEOUT = 8
 AGENT_WAIT_TIMEOUT = 1800
 AGENT_WAIT_HEARTBEAT = 30
 AGENT_ERROR_LIMIT = 160
+_LOG_LOCK = threading.Lock()
 
 
 def log(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
+    with _LOG_LOCK:
+        print(f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
 
 
 def fatal(message: str, code: int = 1) -> None:
@@ -112,6 +118,11 @@ def assign_nodes(nodes: list[str], count: int) -> list[str]:
 
 def runner_name(prefix: str, index: int) -> str:
     return f"{prefix}-{index:02d}"
+
+
+def replica_template_name(template_name: str, node: str) -> str:
+    """Per-node template replica on local storage, e.g. ubuntu-2604-runner-pve2."""
+    return f"{template_name}-{node}"
 
 
 def render_ipconfig(template: str, index: int, ip_start: int) -> str:
@@ -550,6 +561,7 @@ class Fleet:
         )
         self._gh: GitHub | None = None
         self._used_vmids: set[int] = set()
+        self._vmid_lock = threading.Lock()
 
     @property
     def gh(self) -> GitHub:
@@ -613,7 +625,35 @@ class Fleet:
             if on_node:
                 exact = [row for row in on_node if row.get("name") == self.settings.template_name]
                 return exact[0] if exact else on_node[0]
-        return matches[0]
+        exact = [row for row in matches if row.get("name") == self.settings.template_name]
+        return exact[0] if exact else matches[0]
+
+    def find_template_on_node(self, node: str) -> dict[str, Any] | None:
+        """Return a template already stored on node, or None (no other-node fallback)."""
+        replica = replica_template_name(self.settings.template_name, node)
+        fallback: dict[str, Any] | None = None
+        for row in self.resources("vm"):
+            if not row.get("template") or row.get("node") != node:
+                continue
+            name = row.get("name") or ""
+            vmid = int(row.get("vmid", 0) or 0)
+            if self.settings.template_vmid and vmid == self.settings.template_vmid:
+                return row
+            if name == self.settings.template_name:
+                return row
+            if name == replica:
+                fallback = row
+            elif name.startswith(self.settings.template_name + "-") and fallback is None:
+                fallback = row
+        return fallback
+
+    def find_replica_vm(self, node: str) -> dict[str, Any] | None:
+        """Return ubuntu-2604-runner-<node> on that node even if it is not a template yet."""
+        wanted = replica_template_name(self.settings.template_name, node)
+        for row in self.resources("vm"):
+            if row.get("name") == wanted and row.get("node") == node:
+                return row
+        return None
 
     def storage_info(self, storage: str) -> dict[str, Any]:
         for row in self.pve.call("GET", "storage") or []:
@@ -669,7 +709,14 @@ class Fleet:
                 used.add(int(row["vmid"]))
         return used
 
-    def allocate_vmid(self, used: set[int]) -> int:
+    def allocate_vmid(self, used: set[int] | None = None) -> int:
+        """Cluster-safe VMID allocation. Concurrent callers never share an id."""
+        with self._vmid_lock:
+            if used is None:
+                used = self._used_vmids
+            return self._allocate_vmid_unlocked(used)
+
+    def _allocate_vmid_unlocked(self, used: set[int]) -> int:
         if self.settings.vmid_start is not None:
             vmid = next_unused_vmid(used, self.settings.vmid_start)
             used.add(vmid)
@@ -684,6 +731,30 @@ class Fleet:
             return vmid
         fatal("could not allocate a free Proxmox VMID")
         return 0
+
+    def _reserve_clone_vmid(self, planned: PlannedVM, reuse_planned: bool) -> int:
+        with self._vmid_lock:
+            if reuse_planned and planned.vmid is not None:
+                vmid = planned.vmid
+                self._used_vmids.add(vmid)
+            else:
+                vmid = self._allocate_vmid_unlocked(self._used_vmids)
+            planned.vmid = vmid
+            return vmid
+
+    def allocate_replica_vmid(self) -> int:
+        """Template replicas use cluster nextid so [vm].vmid_start stays for runners."""
+        with self._vmid_lock:
+            for _ in range(32):
+                candidate = self.next_vmid()
+                if candidate not in self._used_vmids:
+                    self._used_vmids.add(candidate)
+                    return candidate
+                vmid = next_unused_vmid(self._used_vmids, candidate + 1)
+                self._used_vmids.add(vmid)
+                return vmid
+            fatal("could not allocate a free Proxmox VMID for a template replica")
+            return 0
 
     def vm_config(self, node: str, vmid: int) -> dict[str, Any]:
         return self.pve.call("GET", f"nodes/{node}/qemu/{vmid}/config") or {}
@@ -700,23 +771,51 @@ class Fleet:
         fatal("could not determine template disk storage; set [proxmox].storage")
         return ""
 
+    def _convert_to_template(self, row: dict[str, Any]) -> dict[str, Any]:
+        node = row["node"]
+        vmid = int(row["vmid"])
+        if row.get("template"):
+            return row
+        log(f"converting {row.get('name')} (VMID {vmid}) to template on {node}")
+        self.pve.post_task(f"nodes/{node}/qemu/{vmid}/template", {}, self.settings.task_timeout)
+        updated = dict(row)
+        updated["template"] = 1
+        return updated
+
+    def _reuse_local_template(self, node: str) -> dict[str, Any] | None:
+        existing = self.find_template_on_node(node)
+        if existing is not None:
+            return existing
+        leftover = self.find_replica_vm(node)
+        if leftover is None:
+            return None
+        return self._convert_to_template(leftover)
+
     def ensure_template_on_node(self, node: str, storage: str) -> dict[str, Any]:
-        existing = self.find_template(node)
-        if existing.get("node") == node:
+        existing = self._reuse_local_template(node)
+        if existing is not None:
             return existing
         source = self.find_template()
         if self.storage_is_shared(storage):
             log(f"template {source['vmid']} is on shared storage {storage}; clones can target {node}")
             return source
+        return self._copy_template_to_node(source, node, storage)
+
+    def _copy_template_to_node(self, source: dict[str, Any], node: str, storage: str) -> dict[str, Any]:
+        """Clone the source template on its node, migrate the replica, convert to template.
+
+        This is the only migrate on the local-storage path. Runner VMs are never migrated.
+        """
         self.require_storage_on_node(node, storage)
-        replica_vmid = self.next_vmid()
-        replica_name = f"{self.settings.template_name}-{node}"
+        replica_vmid = self.allocate_replica_vmid()
+        replica_name = replica_template_name(self.settings.template_name, node)
+        source_node = source["node"]
         log(
-            f"local storage {storage}: cloning template {source['vmid']} on {source['node']} "
-            f"to {replica_vmid} then migrating to {node}"
+            f"Phase A: cloning template {source['vmid']} on {source_node} "
+            f"to {replica_vmid} ({replica_name}) then migrating to {node}"
         )
         self.pve.post_task(
-            f"nodes/{source['node']}/qemu/{source['vmid']}/clone",
+            f"nodes/{source_node}/qemu/{source['vmid']}/clone",
             {
                 "newid": replica_vmid,
                 "name": replica_name,
@@ -725,31 +824,86 @@ class Fleet:
             },
             self.settings.task_timeout,
         )
-        self.pve.post_task(
-            f"nodes/{source['node']}/qemu/{replica_vmid}/migrate",
-            {
-                "target": node,
-                "online": 0,
-                "with-local-disks": 1,
-                "targetstorage": storage,
-            },
-            self.settings.task_timeout,
-        )
+        if source_node != node:
+            self.pve.post_task(
+                f"nodes/{source_node}/qemu/{replica_vmid}/migrate",
+                {
+                    "target": node,
+                    "online": 0,
+                    "with-local-disks": 1,
+                    "targetstorage": storage,
+                },
+                self.settings.task_timeout,
+            )
         self.pve.post_task(f"nodes/{node}/qemu/{replica_vmid}/template", {}, self.settings.task_timeout)
         log(f"created template replica {replica_vmid} ({replica_name}) on {node}")
         return {"node": node, "vmid": replica_vmid, "name": replica_name, "template": 1}
 
+    def place_templates(self, nodes: list[str], storage: str) -> dict[str, dict[str, Any]]:
+        """Phase A: a template replica on every local-storage node. Shared storage: no replica."""
+        source = self.find_template()
+        if self.storage_is_shared(storage):
+            log(
+                f"Phase A: template {source['vmid']} is on shared storage {storage}; "
+                "no per-node replica"
+            )
+            return {node: source for node in nodes}
+
+        placed: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        for node in nodes:
+            existing = self._reuse_local_template(node)
+            if existing is not None:
+                log(f"Phase A: reusing template {existing['vmid']} ({existing.get('name')}) on {node}")
+                placed[node] = existing
+            else:
+                missing.append(node)
+        if not missing:
+            return placed
+
+        self._used_vmids |= self.cluster_vmids()
+        log(
+            f"Phase A: copying template {source['vmid']} from {source['node']} "
+            f"to {', '.join(missing)} (parallel replica copies)"
+        )
+
+        def copy_one(node: str) -> dict[str, Any]:
+            return self._copy_template_to_node(source, node, storage)
+
+        results = self._run_parallel(missing, copy_one, "template placement")
+        for node, replica in zip(missing, results):
+            placed[node] = replica
+        return placed
+
+    def _run_parallel(self, items: list[Any], fn: Any, label: str) -> list[Any]:
+        """Run fn(item) for each item. One item stays on this thread; several use a pool."""
+        if not items:
+            return []
+        if len(items) == 1:
+            return [fn(items[0])]
+        results: list[Any] = [None] * len(items)
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=len(items)) as pool:
+            futs = {pool.submit(fn, item): index for index, item in enumerate(items)}
+            for fut in as_completed(futs):
+                index = futs[fut]
+                item = items[index]
+                ident = getattr(item, "name", None) or str(item)
+                try:
+                    results[index] = fut.result()
+                except SystemExit as exc:
+                    errors.append(f"{ident}: {exc}")
+                except Exception as exc:
+                    errors.append(f"{ident}: {exc}")
+        if errors:
+            fatal(f"{label} failed: " + "; ".join(errors))
+        return results
+
     def clone_runner(self, template: dict[str, Any], planned: PlannedVM, storage: str) -> int:
-        used = self._used_vmids
         source_node = template["node"]
         last_error: BaseException | None = None
         for attempt in range(2):
-            if attempt == 0 and planned.vmid is not None:
-                vmid = planned.vmid
-                used.add(vmid)
-            else:
-                vmid = self.allocate_vmid(used)
-            planned.vmid = vmid
+            vmid = self._reserve_clone_vmid(planned, reuse_planned=(attempt == 0))
             params: dict[str, Any] = {
                 "newid": vmid,
                 "name": planned.name,
@@ -765,7 +919,7 @@ class Fleet:
                         f"internal error: template for {planned.node} is still on {source_node}. "
                         "Local disks need a per-node template replica."
                     )
-                log(f"cloning {template['vmid']} -> {vmid} ({planned.name}) on {planned.node}")
+                log(f"cloning {template['vmid']} -> {vmid} ({planned.name}) locally on {planned.node}")
             try:
                 self.pve.post_task(
                     f"nodes/{source_node}/qemu/{template['vmid']}/clone",
@@ -781,6 +935,30 @@ class Fleet:
                     continue
                 raise
         raise RuntimeError(f"clone {planned.name} failed: {last_error}")
+
+    def clone_planned_runners(
+        self,
+        planned: list[PlannedVM],
+        templates_by_node: dict[str, dict[str, Any]],
+        storage: str,
+    ) -> None:
+        """Phase B: full-clone every new runner from the local replica. No runner migrate."""
+        new_items = [item for item in planned if not item.existed]
+        if not new_items:
+            log("Phase B: no new runner VMs to clone")
+            return
+        log(
+            f"Phase B: full-cloning {len(new_items)} runner VM(s) in parallel "
+            f"from per-node templates (local disks, no runner migrate)"
+        )
+
+        def clone_one(item: PlannedVM) -> int:
+            template = templates_by_node[item.node]
+            vmid = self.clone_runner(template, item, storage)
+            item.vmid = vmid
+            return vmid
+
+        self._run_parallel(new_items, clone_one, "parallel clone")
 
     def apply_cloudinit(self, node: str, vmid: int, index: int) -> None:
         # Proxmox Cloud-Init has no cigroups field for ciuser. docker
@@ -969,7 +1147,7 @@ class Fleet:
 
     def plan(self, count: int, nodes: list[str]) -> list[PlannedVM]:
         assignment = assign_nodes(nodes, count)
-        used = self.cluster_vmids()
+        used = self.cluster_vmids() | self._used_vmids
         self._used_vmids = used
         planned: list[PlannedVM] = []
         for index, node in enumerate(assignment, start=1):
@@ -988,6 +1166,35 @@ class Fleet:
             planned.append(item)
         return planned
 
+    def boot_planned_runners(self, planned: list[PlannedVM]) -> None:
+        """Phase C start/wait: Cloud-Init + start + qemu-guest-agent, in parallel."""
+        log(
+            f"Phase C: Cloud-Init, start, and wait for qemu-guest-agent "
+            f"({len(planned)} VM(s), parallel)"
+        )
+
+        def boot_one(item: PlannedVM) -> None:
+            assert item.vmid is not None
+            self.apply_cloudinit(item.node, item.vmid, item.index)
+            self.start_vm(item.node, item.vmid)
+            self.wait_agent(item.node, item.vmid)
+
+        self._run_parallel(planned, boot_one, "start/wait-agent")
+
+    def register_planned_runners(
+        self,
+        planned: list[PlannedVM],
+        registered: dict[str, Any],
+    ) -> None:
+        """Phase C register: guest-setup stays sequential (GitHub token + long exec)."""
+        for item in planned:
+            assert item.vmid is not None
+            already = registered.get(item.name)
+            if already and already.get("status") == "online":
+                log(f"{item.name} is already registered and online; running guest setup only if needed")
+            self.setup_guest(item.node, item.vmid, item.name)
+            log(f"{item.name} is ready on {item.node} (VMID {item.vmid})")
+
     def deploy(self, count: int) -> None:
         nodes = self.online_nodes()
         log(f"online target nodes: {', '.join(nodes)}")
@@ -1005,30 +1212,19 @@ class Fleet:
         self.settings.runner_tarball_url = tarball
         log(f"actions/runner linux-x64 {version}: {tarball}")
 
-        templates_by_node: dict[str, dict[str, Any]] = {}
-        if shared:
-            for node in nodes:
-                templates_by_node[node] = template
-        else:
-            for node in nodes:
-                templates_by_node[node] = self.ensure_template_on_node(node, storage)
+        self._used_vmids = self.cluster_vmids()
+        templates_by_node = self.place_templates(nodes, storage)
 
         planned = self.plan(count, nodes)
-        registered = {row.get("name"): row for row in self.gh.list_runners(self.settings.github_kind, self.settings.github_target)}
+        registered = {
+            row.get("name"): row
+            for row in self.gh.list_runners(self.settings.github_kind, self.settings.github_target)
+        }
 
-        for item in planned:
-            if not item.existed:
-                item.vmid = self.clone_runner(templates_by_node[item.node], item, storage)
-            assert item.vmid is not None
-            self.apply_cloudinit(item.node, item.vmid, item.index)
-            self.start_vm(item.node, item.vmid)
-            self.wait_agent(item.node, item.vmid)
-            already = registered.get(item.name)
-            if already and already.get("status") == "online":
-                log(f"{item.name} is already registered and online; running guest setup only if needed")
-            self.setup_guest(item.node, item.vmid, item.name)
-            log(f"{item.name} is ready on {item.node} (VMID {item.vmid})")
-
+        # Phase B must finish all clones before Phase C guest-setup.
+        self.clone_planned_runners(planned, templates_by_node, storage)
+        self.boot_planned_runners(planned)
+        self.register_planned_runners(planned, registered)
         self.print_status(planned)
 
     def destroy(self, count: int | None, remove_github: bool) -> None:
