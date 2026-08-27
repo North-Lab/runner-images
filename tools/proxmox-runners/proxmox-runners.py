@@ -238,6 +238,15 @@ def http_status(exc: BaseException) -> int | None:
     return None
 
 
+def is_absent_vm_error(exc: BaseException) -> bool:
+    """True when Proxmox says this VMID is already gone (404 or missing config)."""
+    status = http_status(exc)
+    text = str(exc).lower()
+    if status == 404:
+        return True
+    return "does not exist" in text or "no such vm" in text or "no such guest" in text
+
+
 def is_agent_forbidden(exc: BaseException) -> bool:
     if http_status(exc) in {401, 403}:
         return True
@@ -369,11 +378,18 @@ class Proxmox:
             time.sleep(3)
         raise TimeoutError(f"timed out waiting for task {upid}")
 
-    def post_task(self, path: str, params: dict[str, Any], timeout: int) -> Any:
-        upid = self.call("POST", path, params, timeout=timeout)
+    def request_task(self, method: str, path: str, params: dict[str, Any], timeout: int) -> Any:
+        """POST/DELETE that returns a UPID: wait until that task finishes."""
+        upid = self.call(method, path, params, timeout=timeout)
         if isinstance(upid, str):
             self.wait_task(upid, timeout)
         return upid
+
+    def post_task(self, path: str, params: dict[str, Any], timeout: int) -> Any:
+        return self.request_task("POST", path, params, timeout)
+
+    def delete_task(self, path: str, params: dict[str, Any], timeout: int) -> Any:
+        return self.request_task("DELETE", path, params, timeout)
 
 
 class GitHub:
@@ -595,6 +611,10 @@ class Fleet:
         self._gh: GitHub | None = None
         self._used_vmids: set[int] = set()
         self._vmid_lock = threading.Lock()
+        self._resources_cache: list[dict[str, Any]] | None = None
+        self._skip_reuse_nodes: set[str] = set()
+        self._skip_reuse_vmids: set[int] = set()
+        self._skip_reuse_names: set[str] = set()
 
     @property
     def gh(self) -> GitHub:
@@ -625,9 +645,25 @@ class Fleet:
             fatal("GET /nodes returned no online nodes")
         return online
 
-    def resources(self, rtype: str | None = None) -> list[dict[str, Any]]:
-        params = {"type": rtype} if rtype else None
-        return self.pve.call("GET", "cluster/resources", params) or []
+    def invalidate_resources(self) -> None:
+        """Drop any cached cluster/resources snapshot after mutations."""
+        self._resources_cache = None
+
+    def resources(self, rtype: str | None = None, *, refresh: bool = True) -> list[dict[str, Any]]:
+        """Cluster inventory. Default refresh=True so deletes/clones are not served stale."""
+        if refresh:
+            params = {"type": rtype} if rtype else None
+            rows = self.pve.call("GET", "cluster/resources", params) or []
+            if rtype is None:
+                self._resources_cache = rows
+            else:
+                self._resources_cache = None
+            return rows
+        if self._resources_cache is None:
+            self._resources_cache = self.pve.call("GET", "cluster/resources") or []
+        if rtype:
+            return [row for row in self._resources_cache if row.get("type") == rtype]
+        return list(self._resources_cache)
 
     def find_vm(self, name: str) -> dict[str, Any] | None:
         for row in self.resources("vm"):
@@ -872,6 +908,42 @@ class Fleet:
         log(f"created template replica {replica_vmid} ({replica_name}) on {node}")
         return {"node": node, "vmid": replica_vmid, "name": replica_name, "template": 1}
 
+    def _qemu_vm_exists(self, node: str, vmid: int) -> bool:
+        try:
+            data = self.pve.call("GET", f"nodes/{node}/qemu/{vmid}/status/current")
+            return data is not None
+        except (ProxmoxAPIError, RuntimeError) as exc:
+            if is_absent_vm_error(exc):
+                return False
+            raise
+
+    def _wait_replica_absent(self, node: str, vmid: int, name: str) -> None:
+        """Poll qemu + refreshed cluster/resources until this replica is gone."""
+        deadline = time.time() + self.settings.task_timeout
+        while time.time() < deadline:
+            self.invalidate_resources()
+            in_inventory = False
+            for row in self.resources("vm", refresh=True):
+                if int(row.get("vmid") or 0) == vmid:
+                    in_inventory = True
+                    break
+                if name and row.get("name") == name and row.get("node") == node:
+                    in_inventory = True
+                    break
+            on_node = self._qemu_vm_exists(node, vmid)
+            if not on_node:
+                if in_inventory:
+                    log(
+                        f"Phase A: replica {name} (VMID {vmid}) is gone on {node}; "
+                        "cluster/resources still lists it (stale), will not reuse"
+                    )
+                return
+            time.sleep(2)
+        fatal(
+            f"replica {name} (VMID {vmid}) on {node} is still present after delete; "
+            "refusing to reuse it"
+        )
+
     def delete_replica_template(self, row: dict[str, Any], node: str, source: dict[str, Any]) -> None:
         reason = replica_delete_refusal(
             row,
@@ -883,21 +955,84 @@ class Fleet:
         if reason:
             fatal(reason)
         vmid = int(row["vmid"])
-        log(f"Phase A: deleting replica template {row.get('name')} (VMID {vmid}) on {node}")
-        self.pve.call(
-            "DELETE",
-            f"nodes/{node}/qemu/{vmid}",
-            {"purge": 1, "destroy-unreferenced-disks": 1},
-        )
-        self._used_vmids.discard(vmid)
+        name = row.get("name") or ""
+        source_vmid = int(source.get("vmid") or 0)
+        if source_vmid and vmid == source_vmid:
+            fatal(f"refusing to delete the source Packer template (VMID {vmid}) on {source.get('node')}")
+        if name == self.settings.template_name:
+            fatal(
+                f"refusing to delete {name!r} (VMID {vmid}): that is the source Packer template"
+            )
+        log(f"Phase A: deleting replica template {name} (VMID {vmid}) on {node}")
+        try:
+            delete_task = getattr(self.pve, "delete_task", None)
+            if delete_task is not None:
+                delete_task(
+                    f"nodes/{node}/qemu/{vmid}",
+                    {"purge": 1, "destroy-unreferenced-disks": 1},
+                    self.settings.task_timeout,
+                )
+            else:
+                upid = self.pve.call(
+                    "DELETE",
+                    f"nodes/{node}/qemu/{vmid}",
+                    {"purge": 1, "destroy-unreferenced-disks": 1},
+                    timeout=self.settings.task_timeout,
+                )
+                if isinstance(upid, str):
+                    self.pve.wait_task(upid, self.settings.task_timeout)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            if is_absent_vm_error(exc):
+                log(f"Phase A: replica {name} (VMID {vmid}) on {node} already gone")
+            else:
+                fatal(
+                    f"failed to delete replica template {name} (VMID {vmid}) on {node}: {exc}"
+                )
+        self.invalidate_resources()
+        self._wait_replica_absent(node, vmid, name)
+        # Keep the VMID reserved this run so a stale inventory cannot reallocate it
+        # as a clone source or nextid.
+        self._used_vmids.add(vmid)
+        self._skip_reuse_nodes.add(node)
+        self._skip_reuse_vmids.add(vmid)
+        if name:
+            self._skip_reuse_names.add(name)
 
-    def remove_node_replicas(self, nodes: list[str], source: dict[str, Any]) -> None:
-        """Delete {template}-{node} replicas so Phase A can copy the current source again."""
+    def remove_node_replicas(self, nodes: list[str], source: dict[str, Any]) -> list[tuple[str, int, str]]:
+        """Delete {template}-{node} replicas so Phase A can copy the current source again.
+
+        Never deletes the source Packer template. Failed deletes are fatal.
+        Returns (node, vmid, name) for each replica that was removed.
+        """
+        removed: list[tuple[str, int, str]] = []
+        source_vmid = int(source.get("vmid") or 0)
         for node in nodes:
             replica = self.find_replica_vm(node)
             if replica is None:
                 continue
+            replica_vmid = int(replica.get("vmid") or 0)
+            if source_vmid and replica_vmid == source_vmid:
+                log(
+                    f"Phase A: leaving source template {source_vmid} "
+                    f"({replica.get('name')}) on {node} in place"
+                )
+                continue
             self.delete_replica_template(replica, node, source)
+            removed.append((node, replica_vmid, replica.get("name") or ""))
+        self.invalidate_resources()
+        self.resources("vm", refresh=True)
+        return removed
+
+    def _should_skip_reuse(self, node: str, existing: dict[str, Any] | None = None) -> bool:
+        if node in self._skip_reuse_nodes:
+            return True
+        if existing is None:
+            return False
+        vmid = int(existing.get("vmid") or 0)
+        name = existing.get("name") or ""
+        return vmid in self._skip_reuse_vmids or name in self._skip_reuse_names
 
     def place_templates(self, nodes: list[str], storage: str) -> dict[str, dict[str, Any]]:
         """Phase A: a template replica on every local-storage node. Shared storage: no replica."""
@@ -918,11 +1053,27 @@ class Fleet:
                 f"{source['vmid']} on {source['node']}"
             )
             self.remove_node_replicas(nodes, source)
+            self.invalidate_resources()
+            self.resources("vm", refresh=True)
 
         placed: dict[str, dict[str, Any]] = {}
         missing: list[str] = []
         for node in nodes:
+            if self._should_skip_reuse(node):
+                log(
+                    f"Phase A: not reusing a just-deleted replica on {node}; "
+                    f"will copy from source {source['vmid']}"
+                )
+                missing.append(node)
+                continue
             existing = self._reuse_local_template(node)
+            if existing is not None and self._should_skip_reuse(node, existing):
+                log(
+                    f"Phase A: not reusing deleted {existing.get('name')} "
+                    f"(VMID {existing.get('vmid')}) on {node}"
+                )
+                missing.append(node)
+                continue
             if existing is not None:
                 log(f"Phase A: reusing template {existing['vmid']} ({existing.get('name')}) on {node}")
                 placed[node] = existing
